@@ -1,14 +1,13 @@
-import ua from '#/common/ua';
+import { isTouch } from '@/common/ui';
 
+const SCRIPT = '.script';
 const SCROLL_GAP = 50;
 // px per one 60fps frame so the max is ~1200px per second (~one page)
 const MAX_SCROLL_SPEED = 20;
 const ONE_FRAME_MS = 16;
 // touch-and-hold duration in ms before recognizing dragstart (needed to allow fling-scrolling)
 const LONGPRESS_DELAY = 500;
-const DROP_EVENT_RELAY = 'VM-drop-event-relay';
 
-const isTouch = 'ontouchstart' in document;
 const eventNames = isTouch
   ? { start: 'touchstart', move: 'touchmove', end: 'touchend' }
   : { start: 'dragstart', move: 'mousemove', end: 'mouseup' };
@@ -18,7 +17,6 @@ const noScroll = isTouch && Object.assign(document.createElement('div'), {
   className: 'dragging-noscroll',
 });
 const eventsToSuppress = ['scroll', 'mouseenter', 'mouseleave'];
-const { addEventListener: on, removeEventListener: off } = EventTarget.prototype;
 
 let dragged;
 let elements;
@@ -29,8 +27,10 @@ let longPressEvent;
 let longPressTimer;
 let offsetX;
 let offsetY;
+/** @type {HTMLElement} */
 let original;
 let parent;
+let parentOnDrop;
 let scrollEdgeTop;
 let scrollEdgeBottom;
 let scrollTimer;
@@ -38,35 +38,55 @@ let scrollSpeed;
 let scrollTimestamp;
 let xyCache;
 
-/**
- * @param {Element} el
- * @param {function(from,to)} onDrop
- */
-export default function enableDragging(el, { onDrop }) {
-  if (!parent) {
-    parent = el.parentElement;
-    // pre-FF64 doesn't support `@media (pointer: coarse)`
-    if (isTouch && !matchMedia('(pointer: coarse)').matches) {
-      parent.classList.add('touch');
-    }
+export default function toggleDragging(listEl, moveScript, state) {
+  const onOff = state ? addEventListener : removeEventListener;
+  parent = listEl;
+  parentOnDrop = moveScript;
+  parent::onOff(eventNames.start, isTouch ? onTouchStart : onDragStart);
+  if (!isTouch) {
+    parent::onOff('dblclick', onDblClick, true);
+    parent::onOff('mousedown', onMouseDown, true);
+    if (!state) onMouseUp();
   }
-  el::on(eventNames.start, isTouch ? onTouchStart : onDragStart);
-  el::on(DROP_EVENT_RELAY, () => onDrop(index, lastIndex));
+}
+
+function onDblClick(evt) {
+  const selection = getSelection();
+  const el = evt.target.closest('.script-name');
+  if (el) {
+    selection.removeAllRanges();
+    selection.selectAllChildren(el);
+  }
+}
+
+/** @param {MouseEvent} e */
+function onMouseDown(e) {
+  if (!e.altKey && scriptFromEvent(e)) original.draggable = true;
+  parent::addEventListener('mouseup', onMouseUp, true);
+}
+
+function onMouseUp() {
+  if (original) original.draggable = false;
+  parent::removeEventListener('mouseup', onMouseUp, true);
+}
+
+function onDrop() {
+  parentOnDrop(index, lastIndex);
 }
 
 function onTouchStart(e) {
-  original = this;
+  if (!scriptFromEvent(e)) return;
   longPressEvent = e;
   longPressTimer = setTimeout(onTouchMoveDetect, LONGPRESS_DELAY, 'timer');
-  document::on(eventNames.move, onTouchMoveDetect);
-  document::on(eventNames.end, onTouchEndDetect);
+  addEventListener(eventNames.move, onTouchMoveDetect);
+  addEventListener(eventNames.end, onTouchEndDetect);
 }
 
 function onTouchMoveDetect(e) {
   onTouchEndDetect();
   if (e === 'timer') {
     original::onDragStart(longPressEvent);
-    if (ua.isFirefox && parentCanScroll()) {
+    if (IS_FIREFOX && parentCanScroll()) {
       // FF bug workaround: prevent the script list container from scrolling on drag
       parent.scrollTop += 1;
       parent.scrollTop -= 1;
@@ -76,18 +96,18 @@ function onTouchMoveDetect(e) {
 
 function onTouchEndDetect() {
   clearTimeout(longPressTimer);
-  document::off(eventNames.move, onTouchMoveDetect);
-  document::off(eventNames.end, onTouchEndDetect);
+  removeEventListener(eventNames.move, onTouchMoveDetect);
+  removeEventListener(eventNames.end, onTouchEndDetect);
 }
 
 function onDragStart(e) {
-  original = this;
+  if (!scriptFromEvent(e)) return;
   if (e.cancelable) e.preventDefault();
   const { clientX: x, clientY: y } = e.touches?.[0] || e;
   const rect = original.getBoundingClientRect();
   const parentRect = parent.getBoundingClientRect();
   dragged = original.cloneNode(true);
-  elements = [...parent.children];
+  elements = parent.children::[].filter(el => el.style.display !== 'none');
   index = elements.indexOf(original);
   lastIndex = index;
   elements.splice(index, 1);
@@ -103,14 +123,14 @@ function onDragStart(e) {
   dragged.style.width = `${rect.width}px`;
   parent.appendChild(dragged);
   if (isTouch) parent.insertAdjacentElement('afterBegin', noScroll);
-  document::on(eventNames.move, onDragMouseMove);
-  document::on(eventNames.end, onDragMouseUp);
+  addEventListener(eventNames.move, onDragMouseMove);
+  addEventListener(eventNames.end, onDragMouseUp);
 }
 
 function onDragMouseMove(e) {
   const { clientX: x, clientY: y, target } = e.touches?.[0] || e;
   let moved;
-  const hovered = isTouch ? scriptFromPoint(x, y) : target.closest?.('.script');
+  const hovered = isTouch ? scriptFromPoint(x, y) : target.closest?.(SCRIPT);
   // FF bug: despite placeholder having `pointer-events:none` it's still reported in `target`
   if (hovered && hovered !== original) {
     const rect = hovered.getBoundingClientRect();
@@ -126,13 +146,13 @@ function onDragMouseMove(e) {
 }
 
 function onDragMouseUp() {
-  document::off(eventNames.move, onDragMouseMove);
-  document::off(eventNames.end, onDragMouseUp);
+  removeEventListener(eventNames.move, onDragMouseMove);
+  removeEventListener(eventNames.end, onDragMouseUp);
   stopScrolling();
   dragged.remove();
   if (isTouch) noScroll.remove();
   original.classList.remove('dragging-placeholder');
-  original.dispatchEvent(new Event(DROP_EVENT_RELAY));
+  onDrop();
 }
 
 function animate(hoveredIndex) {
@@ -144,7 +164,10 @@ function animate(hoveredIndex) {
     el.style.transition = 'none';
     el.style.transform = `translateY(${delta}px)`;
   });
-  setTimeout(() => group.forEach(el => el.removeAttribute('style')));
+  setTimeout(() => group.forEach(({ style }) => {
+    style.removeProperty('transition');
+    style.removeProperty('transform');
+  }));
   lastIndex = hoveredIndex;
 }
 
@@ -172,11 +195,11 @@ function doScroll() {
 
 function startScrolling() {
   scrollTimer = setInterval(doScroll, ONE_FRAME_MS);
-  eventsToSuppress.forEach(name => window::on(name, stopPropagation, true));
+  eventsToSuppress.forEach(name => addEventListener(name, stopPropagation, true));
 }
 
 function stopScrolling() {
-  eventsToSuppress.forEach(name => window::off(name, stopPropagation, true));
+  eventsToSuppress.forEach(name => removeEventListener(name, stopPropagation, true));
   if (scrollTimer) clearInterval(scrollTimer);
   scrollTimer = 0;
 }
@@ -189,6 +212,11 @@ function stopPropagation(e) {
 // touch devices are usually slooooow so touchmove causes jank due to frequent elementFromPoint
 function scriptFromPoint(x, y) {
   const key = `${x}:${y}`;
-  const el = xyCache[key] || (xyCache[key] = document.elementFromPoint(x, y)?.closest('.script'));
+  const el = xyCache[key] || (xyCache[key] = document.elementFromPoint(x, y)?.closest(SCRIPT));
   return el;
+}
+
+function scriptFromEvent(e) {
+  original = e.target.closest(SCRIPT);
+  return original;
 }

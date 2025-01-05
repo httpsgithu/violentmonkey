@@ -1,5 +1,2 @@
-export default {
-  commands: {},
-  values: {},
-  state: 0,
-};
+export const commands = createNullObj();
+export const storages = createNullObj();

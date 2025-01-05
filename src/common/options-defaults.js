@@ -1,63 +1,94 @@
-import { INJECT_AUTO } from './consts';
+import { BLACKLIST, BLACKLIST_NET, FILE_GLOB_ALL } from '@/common/consts';
+
+export const kAutocompleteOnTyping = 'autocompleteOnTyping';
+export const kFiltersPopup = 'filtersPopup';
+export const kKillTrailingSpaceOnSave = 'killTrailingSpaceOnSave';
+export const kPopupWidth = 'popupWidth';
+export const kShowTrailingSpace = 'showTrailingSpace';
+export const kScriptTemplate = 'scriptTemplate';
+export const kUpdateEnabledScriptsOnly = 'updateEnabledScriptsOnly';
+const defaultsValueEditor = {
+  [kAutocompleteOnTyping]: 100,
+  lineWrapping: false,
+  indentWithTabs: false,
+  indentUnit: 2,
+  tabSize: 2,
+  undoDepth: 500,
+};
+export const defaultsEditor = {
+  [kKillTrailingSpaceOnSave]: true,
+  [kShowTrailingSpace]: true,
+  ...defaultsValueEditor,
+};
 
 export default {
-  isApplied: true,
+  [IS_APPLIED]: true,
+  [BLACKLIST]: FILE_GLOB_ALL,
+  [BLACKLIST_NET]: FILE_GLOB_ALL,
+  [kPopupWidth]: 320,
+  [kUpdateEnabledScriptsOnly]: true,
   autoUpdate: 1, // days, 0 = disable
   // ignoreGrant: false,
   lastUpdate: 0,
   lastModified: 0,
-  /** @type 'unique' | 'total' | '' */
+  /** @type {VMBadgeMode} */
   showBadge: 'unique',
+  badgeColor: '#880088',
+  badgeColorBlocked: '#888888',
   exportValues: true,
-  expose: { // use percent-encoding for '.'
+  exportNameTemplate: '[violentmonkey]_YYYY-MM-DD_HH.mm.ss',
+  [EXPOSE]: { // use percent-encoding for '.'
     'greasyfork%2Eorg': true,
     'sleazyfork%2Eorg': false,
   },
   closeAfterInstall: false,
+  editAfterInstall: false,
+  helpForLocalFile: true,
   trackLocalFile: false,
   autoReload: false,
   features: null,
-  blacklist: null,
   syncScriptStatus: true,
   sync: null,
-  customCSS: null,
+  customCSS: '',
   importScriptData: true,
   importSettings: true,
   notifyUpdates: false,
   notifyUpdatesGlobal: false, // `true` ignores script.config.notifyUpdates
   version: null,
-  /** @type 'auto' | 'page' | 'content' */
-  defaultInjectInto: INJECT_AUTO,
+  /** @type {VMScriptInjectInto} */
+  defaultInjectInto: AUTO,
+  ffInject: true,
+  xhrInject: false,
   filters: {
-    /** @type 'name' | 'code' | 'all' */
+    /** @type {'name' | 'code' | 'all'} */
     searchScope: 'name',
-    /** @type 'exec' | 'alpha' | 'update' */
+    /** @type {boolean} */
+    showOrder: false,
+    /** @type {'exec' | 'alpha' | 'update'} */
     sort: 'exec',
-    /** @type boolean */
+    /** @type {boolean} */
     viewSingleColumn: false,
-    /** @type boolean */
+    /** @type {boolean} */
     viewTable: false,
   },
-  filtersPopup: {
-    /** @type 'exec' | 'alpha' */
+  [kFiltersPopup]: {
+    /** @type {'exec' | 'alpha'} */
     sort: 'exec',
     enabledFirst: false,
-    hideDisabled: false,
+    groupRunAt: true,
+    /** @type {'' | 'hide' | 'group'} where '' = show */
+    hideDisabled: '',
   },
-  editor: {
-    lineWrapping: false,
-    indentWithTabs: false,
-    indentUnit: 2,
-    tabSize: 2,
-    undoDepth: 200,
-  },
+  editor: defaultsEditor,
+  editorTheme: '',
+  editorThemeName: null,
   editorWindow: false, // whether popup opens editor in a new window
   editorWindowPos: {}, // { left, top, width, height }
   editorWindowSimple: true, // whether to open a simplified popup or a normal browser window
-  scriptTemplate: `\
+  [kScriptTemplate]: `\
 // ==UserScript==
 // @name        New script {{name}}
-// @namespace   Violentmonkey Scripts
+// @namespace   ${VIOLENTMONKEY} Scripts
 // @match       {{url}}
 // @grant       none
 // @version     1.0
@@ -65,7 +96,8 @@ export default {
 // @description {{date}}
 // ==/UserScript==
 `,
-  // Enables automatic updates to the default template with new versions of VM
-  /** @type {?Boolean} this must be |null| for template-hook.js upgrade routine */
-  scriptTemplateEdited: null,
+  showAdvanced: true,
+  valueEditor: defaultsValueEditor,
+  /** @type {'' | 'dark' | 'light'} */
+  uiTheme: '',
 };

@@ -3,10 +3,11 @@
 </template>
 
 <script>
-const requireIcon = require.context('#/resources/svg', false, /\.svg$/);
+const requireIcon = require.context('@/resources/svg', false, /\.svg$/);
 requireIcon.keys().map(key => requireIcon(key));
+// TODO: compile svg to font during build
+</script>
 
-export default {
-  props: ['name'],
-};
+<script setup>
+defineProps(['name']);
 </script>

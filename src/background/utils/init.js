@@ -1,13 +1,15 @@
-export const extensionRoot = browser.runtime.getURL('/');
+export const commands = {};
+export const addPublicCommands = obj => Object.assign(commands, obj);
+/** Commands that can be used only by an extension page i.e. not by a content script */
+export const addOwnCommands = obj => {
+  for (const key in obj) {
+    (commands[key] = obj[key]).isOwn = true;
+  }
+};
 
-export const preInitialize = [];
-export const postInitialize = [];
-
-export async function initialize(main) {
-  const run = init => (typeof init === 'function' ? init() : init);
-  await Promise.all(preInitialize.map(run));
-  await run(main);
-  await Promise.all(postInitialize.map(run));
-  preInitialize.length = 0;
-  postInitialize.length = 0;
-}
+export let resolveInit;
+export let init = new Promise(r => {
+  resolveInit = () => Promise.all(init.deps).then(r);
+});
+init.deps = [];
+init.then(() => (init = null));

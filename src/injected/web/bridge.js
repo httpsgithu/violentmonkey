@@ -1,36 +1,48 @@
-import { getUniqId } from '#/common';
-import { assign } from '#/common/object';
-import { Promise } from '../utils/helpers';
-
-const handlers = {};
-const callbacks = {};
+const handlers = createNullObj();
+export const addHandlers = obj => assign(handlers, obj);
+export const callbacks = createNullObj();
+/**
+ * @mixes VMInjection.Info
+ * @property {VMBridgePostFunc} post - synchronous
+ * @property {VMBridgeMode} mode
+ */
 const bridge = {
-  callbacks,
-  addHandlers(obj) {
-    assign(handlers, obj);
+  __proto__: null,
+  onHandle({ cmd, data, node }) {
+    const fn = handlers[cmd];
+    if (fn) node::fn(data);
   },
-  onHandle({ cmd, data }) {
-    handlers[cmd]?.(data);
-  },
-  send(cmd, data) {
-    return new Promise(resolve => {
-      postWithCallback(cmd, data, resolve);
-    });
-  },
-  sendSync(cmd, data) {
+  /** @return {Promise} asynchronous */
+  promise(cmd, data, node) {
+    let cb;
     let res;
-    postWithCallback(cmd, data, payload => { res = payload; });
+    res = new SafePromise(resolve => {
+      cb = resolve;
+    });
+    if (IS_FIREFOX) setPrototypeOf(res, SafePromiseConstructor);
+    postWithCallback(cmd, data, node, cb);
     return res;
   },
+  /** @return {?} synchronous */
+  call: postWithCallback,
 };
 
-function postWithCallback(cmd, data, cb) {
-  const id = getUniqId();
-  callbacks[id] = (payload) => {
-    delete callbacks[id];
-    cb(payload);
-  };
-  bridge.post(cmd, { callbackId: id, payload: data });
+let callbackResult;
+
+function postWithCallback(cmd, data, node, cb, customCallbackId) {
+  const id = safeGetUniqId();
+  callbacks[id] = cb || defaultCallback;
+  if (customCallbackId) {
+    setOwnProp(data, customCallbackId, id);
+  } else {
+    data = { [CALLBACK_ID]: id, data };
+  }
+  bridge.post(cmd, data, node);
+  if (!cb) return callbackResult;
+}
+
+function defaultCallback(val) {
+  callbackResult = val;
 }
 
 export default bridge;

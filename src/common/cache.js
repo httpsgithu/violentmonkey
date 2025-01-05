@@ -15,35 +15,43 @@ export default function initCache({
   let batchStartTime;
   // eslint-disable-next-line no-return-assign
   const getNow = () => batchStarted && batchStartTime || (batchStartTime = performance.now());
-  return {
-    batch, get, getValues, pop, put, del, has, hit, destroy,
+  const OVERRUN = 1000; // in ms, to reduce frequency of calling setTimeout
+  const exports = {
+    batch, get, some, pop, put, del, has, hit, destroy,
   };
+  if (process.env.DEV) Object.defineProperty(exports, 'data', { get: () => cache });
+  return exports;
   function batch(enable) {
     batchStarted = enable;
     batchStartTime = 0;
   }
-  function get(key, def) {
+  function get(key, def, shouldHit = true) {
     const item = cache[key];
+    if (item && shouldHit) {
+      reschedule(item, item.lifetime);
+    }
     return item ? item.value : def;
   }
-  function getValues() {
-    return Object.values(cache).map(item => item.value);
+  /**
+   * @param {(val:?, key:string) => void} fn
+   * @param {Object} [thisObj]
+   */
+  function some(fn, thisObj) {
+    for (const key in cache) {
+      const item = cache[key];
+      // Might be already deleted by fn
+      if (item && fn.call(thisObj, item.value, key)) {
+        return true;
+      }
+    }
   }
   function pop(key, def) {
     const value = get(key, def);
     del(key);
     return value;
   }
-  function put(key, value, lifetime = defaultLifetime) {
-    if (value) {
-      cache[key] = {
-        value,
-        expiry: lifetime + getNow(),
-      };
-      reschedule(lifetime);
-    } else {
-      del(key);
-    }
+  function put(key, value, lifetime) {
+    reschedule(cache[key] = lifetime ? { value, lifetime } : { value }, lifetime);
     return value;
   }
   function del(key) {
@@ -54,13 +62,12 @@ export default function initCache({
     }
   }
   function has(key) {
-    return cache[key];
+    return key in cache;
   }
-  function hit(key, lifetime = defaultLifetime) {
+  function hit(key, lifetime) {
     const entry = cache[key];
     if (entry) {
-      entry.expiry = lifetime + getNow();
-      reschedule(lifetime);
+      reschedule(entry, lifetime);
     }
   }
   function destroy() {
@@ -77,18 +84,17 @@ export default function initCache({
     clearTimeout(timer);
     timer = 0;
   }
-  function reschedule(lifetime) {
+  function reschedule(entry, lifetime = defaultLifetime) {
+    entry.expiry = lifetime + getNow();
     if (timer) {
       if (lifetime >= minLifetime) return;
       clearTimeout(timer);
     }
     minLifetime = lifetime;
-    timer = setTimeout(trim, lifetime);
+    timer = setTimeout(trim, lifetime + OVERRUN);
   }
   function trim() {
-    // next timer won't be able to run earlier than 10ms
-    // so we'll sweep the upcoming expired entries in this run
-    const now = performance.now() + 10;
+    const now = performance.now();
     let closestExpiry = Number.MAX_SAFE_INTEGER;
     // eslint-disable-next-line guard-for-in
     for (const key in cache) {
@@ -101,7 +107,7 @@ export default function initCache({
     }
     minLifetime = closestExpiry - now;
     timer = closestExpiry < Number.MAX_SAFE_INTEGER
-      ? setTimeout(trim, minLifetime)
+      ? setTimeout(trim, minLifetime + OVERRUN)
       : 0;
   }
 }

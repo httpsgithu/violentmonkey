@@ -1,23 +1,10 @@
-import { showConfirmation } from '#/common/ui';
+import { reactive } from 'vue';
+import { loadQuery } from '@/common';
+import { showConfirmation } from '@/common/ui';
 import { i18n } from './util';
 
-function parse(hash) {
-  const [pathname, search = ''] = hash.split('?');
-  const query = search.split('&').reduce((res, seq) => {
-    if (seq) {
-      const [key, val] = seq.split('=');
-      res[decodeURIComponent(key)] = decodeURIComponent(val);
-    }
-    return res;
-  }, {});
-  const paths = pathname.split('/');
-  return {
-    hash, pathname, paths, query,
-  };
-}
-
 const stack = [];
-export const route = {};
+export const route = reactive(/** @type {VMRoute} */{});
 export const lastRoute = () => stack[stack.length - 1] || {};
 
 updateRoute();
@@ -25,7 +12,20 @@ updateRoute();
 function updateRoute(noConfirm) {
   const hash = window.location.hash.slice(1);
   if (noConfirm || !route.confirmChange) {
-    Object.assign(route, parse(hash));
+    const [pathname, search = ''] = hash.split('?');
+    /**
+     * @typedef {Object} VMRoute
+     * @prop {string} hash - entire hash without # e.g. 'path/name?foo=1&bar=2'
+     * @prop {string} pathname - 'path/name'
+     * @prop {string[]} paths - ['path', 'name']
+     * @prop {StringMap} query - {foo: '1', bar: '2'}
+     */
+    Object.assign(route, {
+      hash,
+      pathname,
+      paths: pathname.split('/'),
+      query: loadQuery(search),
+    });
   } else if (route.hash !== hash) {
     // restore the pinned route
     setRoute(route.hash, false, true);
@@ -34,8 +34,8 @@ function updateRoute(noConfirm) {
 }
 
 // popstate should be the first to ensure hashchange listeners see the correct lastRoute
-window.addEventListener('popstate', () => stack.pop());
-window.addEventListener('hashchange', () => updateRoute(), false);
+addEventListener('popstate', () => stack.pop());
+addEventListener('hashchange', () => updateRoute(), false);
 
 export function setRoute(hash, replace, noConfirm) {
   let hashString = `${hash}`;
@@ -51,12 +51,11 @@ export function setRoute(hash, replace, noConfirm) {
 
 export function getUnloadSentry(onConfirm, onCancel) {
   async function confirmPopState(hash) {
-    try {
+    if (await showConfirmation(i18n('confirmNotSaved'))) {
       // popstate cannot be prevented so we pin current `route` and display a confirmation
-      await showConfirmation(i18n('confirmNotSaved'));
       setRoute(hash, false, true);
       onConfirm?.();
-    } catch {
+    } else {
       onCancel?.();
     }
   }

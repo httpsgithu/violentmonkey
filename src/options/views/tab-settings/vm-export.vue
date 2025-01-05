@@ -1,92 +1,62 @@
 <template>
-  <section>
-    <h3 v-text="i18n('labelDataExport')"></h3>
-    <button v-text="i18n('buttonExportData')" @click="handleExport" :disabled="exporting"></button>
+  <div class="export">
+    <div class="flex flex-wrap center-items mr-1c">
+      <button v-text="i18n('buttonExportData')" @click="handleExport" :disabled="exporting"/>
+      <setting-text name="exportNameTemplate" ref="tpl" has-reset :has-save="false" :rows="1"
+                    class="tpl flex flex-1 center-items ml-1c"/>
+      <vm-date-info/>
+      <span hidden v-text="fileName"/>
+    </div>
     <div class="mt-1">
       <setting-check name="exportValues" :label="i18n('labelExportScriptData')" />
     </div>
     <modal
-      v-if="store.ffDownload"
+      v-if="ffDownload"
       transition="in-out"
-      :visible="!!store.ffDownload.url"
-      @close="store.ffDownload = {}">
-      <div class="export-modal modal-content">
-        <a :download="store.ffDownload.name" :href="store.ffDownload.url">
+      :show="!!ffDownload.url"
+      @close="ffDownload = {}">
+      <div class="modal-content">
+        <a :download="ffDownload.name" :href="ffDownload.url">
           Right click and save as<br />
           <strong>scripts.zip</strong>
         </a>
       </div>
     </modal>
-  </section>
+  </div>
 </template>
 
-<script>
-import Modal from 'vueleton/lib/modal/bundle';
-import { getScriptName, sendCmd } from '#/common';
-import { objectGet } from '#/common/object';
-import options from '#/common/options';
-import ua from '#/common/ua';
-import SettingCheck from '#/common/ui/setting-check';
-import { downloadBlob } from '#/common/download';
-import loadZip from '#/common/zip';
-import { store } from '../../utils';
+<script setup>
+import { computed, ref } from 'vue';
+import Modal from 'vueleton/lib/modal';
+import { getScriptName, sendCmdDirectly } from '@/common';
+import { formatDate } from '@/common/date';
+import { objectGet } from '@/common/object';
+import options from '@/common/options';
+import SettingCheck from '@/common/ui/setting-check';
+import SettingText from '@/common/ui/setting-text';
+import { downloadBlob } from '@/common/download';
+import loadZip from '@/common/zip';
+import VmDateInfo from './vm-date-info';
 
-/**
- * Note:
- * - Firefox does not support multiline <select>
- */
-if (ua.isFirefox) store.ffDownload = {};
+/** @type {VMScriptGMInfoPlatform} */
+let ua;
 
-export default {
-  components: {
-    SettingCheck,
-    Modal,
-  },
-  data() {
-    return {
-      store,
-      exporting: false,
-    };
-  },
-  methods: {
-    async handleExport() {
-      this.exporting = true;
-      try {
-        const blob = await exportData();
-        download(blob);
-      } catch (err) {
-        console.error(err);
-      }
-      this.exporting = false;
-    },
-  },
-};
+const tpl = ref();
+const exporting = ref(false);
+const ffDownload = ref(IS_FIREFOX && {});
+const fileName = computed(() => {
+  const tplComp = tpl.value;
+  return tplComp && `${formatDate(tplComp.text.trim() || tplComp.defaultValue)}.zip`;
+});
 
-function leftpad(src, length, pad = '0') {
-  let str = `${src}`;
-  while (str.length < length) str = pad + str;
-  return str;
-}
-
-function getTimestamp() {
-  const date = new Date();
-  return `${
-    date.getFullYear()
-  }-${
-    leftpad(date.getMonth() + 1, 2)
-  }-${
-    leftpad(date.getDate(), 2)
-  }_${
-    leftpad(date.getHours(), 2)
-  }.${
-    leftpad(date.getMinutes(), 2)
-  }.${
-    leftpad(date.getSeconds(), 2)
-  }`;
-}
-
-function getExportname() {
-  return `scripts_${getTimestamp()}.zip`;
+async function handleExport() {
+  try {
+    exporting.value = true;
+    if (IS_FIREFOX && !ua) ua = await sendCmdDirectly('UA');
+    download(await exportData());
+  } finally {
+    exporting.value = false;
+  }
 }
 
 function download(blob) {
@@ -94,19 +64,20 @@ function download(blob) {
    * v56 in Windows https://bugzil.la/1357486
    * v61 in MacOS https://bugzil.la/1385403
    * v63 in Linux https://bugzil.la/1357487 */
-  const FF = ua.isFirefox;
-  // eslint-disable-next-line no-nested-ternary
+  // TODO: remove when strict_min_version >= 63
+  const FF = IS_FIREFOX && parseFloat(ua.browserVersion);
+  const name = fileName.value;
   if (FF && (ua.os === 'win' ? FF < 56 : ua.os === 'mac' ? FF < 61 : FF < 63)) {
     const reader = new FileReader();
     reader.onload = () => {
-      store.ffDownload = {
-        name: getExportname(),
+      ffDownload.value = {
+        name,
         url: reader.result,
       };
     };
     reader.readAsDataURL(blob);
   } else {
-    downloadBlob(blob, getExportname());
+    downloadBlob(blob, name);
   }
 }
 
@@ -116,7 +87,7 @@ function normalizeFilename(name) {
 
 async function exportData() {
   const withValues = options.get('exportValues');
-  const data = await sendCmd('ExportZip', {
+  const data = await sendCmdDirectly('ExportZip', {
     values: withValues,
   });
   const names = {};
@@ -155,7 +126,7 @@ async function exportData() {
   });
   files.push({
     name: 'violentmonkey',
-    content: JSON.stringify(vm),
+    content: JSON.stringify(vm, null, 2), // prettify to help users diff or view it
   });
   const zip = await loadZip();
   const blobWriter = new zip.BlobWriter('application/zip');
@@ -169,7 +140,25 @@ async function exportData() {
 </script>
 
 <style>
-.export-modal {
-  width: 13rem;
+.export {
+  .modal-content {
+    width: 13rem;
+  }
+  .tpl {
+    max-width: 30em;
+    &:focus-within ~ [hidden] {
+      display: initial;
+    }
+    textarea {
+      height: auto;
+      resize: none;
+      white-space: nowrap;
+      overflow: hidden;
+      min-width: 10em;
+    }
+    button[disabled] { // Hide a disabled `reset` button
+      display: none;
+    }
+  }
 }
 </style>

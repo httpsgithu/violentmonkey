@@ -1,233 +1,201 @@
 <template>
-  <div class="tab-settings mb-1c">
-    <h1 class="mt-0" v-text="i18n('labelSettings')"></h1>
+  <div ref="$el" class="tab-settings" :data-show-advanced="settings.showAdvanced">
+    <h1 v-text="i18n('labelSettings')"></h1>
     <section class="mb-1c">
-      <h3 v-text="i18n('labelGeneral')"></h3>
-      <div>
-        <setting-check name="autoReload" :label="i18n('labelAutoReloadCurrentTab')" />
-      </div>
-      <div>
-        <setting-check name="editorWindow" class="mr-2">
-          <tooltip :content="editorWindowHint" :disabled="!editorWindowHint">
-            <span v-text="i18n('optionEditorWindow')"></span>
-          </tooltip>
-        </setting-check>
-        <setting-check name="editorWindowSimple" :label="i18n('optionEditorWindowSimple')" />
-      </div>
-      <div class="ml-2c">
-        <label>
-          <locale-group i18n-key="labelPopupSort">
-            <select v-model="settings['filtersPopup.sort']">
-              <option value="exec" v-text="i18n('filterExecutionOrder')" />
-              <option value="alpha" v-text="i18n('filterAlphabeticalOrder')" />
-            </select>
-          </locale-group>
-        </label>
-        <setting-check name="filtersPopup.enabledFirst" :label="i18n('optionPopupEnabledFirst')" />
-        <setting-check name="filtersPopup.hideDisabled" :label="i18n('optionPopupHideDisabled')" />
-      </div>
-      <div>
-        <label>
-          <span v-text="i18n('labelBadge')"></span>
-          <select v-model="settings.showBadge">
-            <option value="" v-text="i18n('labelBadgeNone')" />
-            <option value="unique" v-text="i18n('labelBadgeUnique')" />
-            <option value="total" v-text="i18n('labelBadgeTotal')" />
-          </select>
-        </label>
-      </div>
+      <h3 v-text="i18n('optionPopup')"/>
+      <settings-popup/>
     </section>
     <section class="mb-1c">
-      <h3 v-text="i18n('titleScriptUpdated')"/>
-      <div>
+      <h3 v-text="i18n('optionUpdate')"/>
+      <div class="ml-2c flex flex-col">
         <label>
           <locale-group i18n-key="labelAutoUpdate">
             <input v-model="settings.autoUpdate" type="number" min=0 max=365 step=1/>
           </locale-group>
         </label>
+        <setting-check :name="kUpdateEnabledScriptsOnly"
+                       :label="i18n('labelEnabledScriptsOnly')" />
       </div>
-      <div>
+      <div class="ml-2c flex flex-col">
         <setting-check name="notifyUpdates" :label="i18n('labelNotifyUpdates')" />
         <setting-check name="notifyUpdatesGlobal" :label="i18n('labelNotifyUpdatesGlobal')"
                        class="ml-2" />
       </div>
     </section>
-    <vm-import></vm-import>
-    <vm-export></vm-export>
+    <section class="mb-2c">
+      <h3 v-text="i18n('labelBackupMaintenance')" :class="{bright: store.isEmpty === 1}"/>
+      <vm-import></vm-import>
+      <vm-export></vm-export>
+      <hr>
+      <vm-maintenance/>
+    </section>
     <vm-sync></vm-sync>
-    <div class="show-advanced">
-      <button @click="showAdvanced = !showAdvanced">
-        <span v-text="i18n('labelAdvanced')"></span>
-        <icon name="arrow" :class="{ rotate: showAdvanced }" />
-      </button>
-    </div>
-    <div v-show="showAdvanced">
+    <details v-for="(obj, key) in {showAdvanced: settings}" :key :open="obj[key]">
+      <summary @click.prevent="obj[key] = !obj[key]">
+        <!-- eslint-disable-next-line vue/no-v-text-v-html-on-component -->
+        <component v-text="i18n('labelAdvanced')" class="inline-block"
+                   :is="obj[key] ? 'h1' : 'h3'"/>
+      </summary>
       <section class="mb-1c">
         <h3 v-text="i18n('labelGeneral')"></h3>
         <div>
           <label>
-            <span v-text="i18n('labelInjectionMode')"></span>
-            <select v-model="settings.defaultInjectInto">
-              <option
-                v-for="option in injectIntoOptions"
-                :key="option"
-                :value="option"
-                v-text="option"
-              />
-            </select>
-            <a class="ml-1" href="https://violentmonkey.github.io/posts/inject-into-context/" target="_blank" rel="noopener noreferrer" v-text="i18n('learnInjectionMode')"></a>
+            <locale-group i18n-key="optionUiTheme">
+              <select v-for="opt in ['uiTheme']" v-model="settings[opt]" :key="opt">
+                <option v-for="(title, value) in items[opt]" :key="value"
+                        :value v-text="title" />
+              </select>
+            </locale-group>
           </label>
         </div>
-        <div>
-          <locale-group i18n-key="labelExposeStatus" class="mr-1c">
+        <div class="ml-2c flex flex-col">
+          <label>
+            <span v-text="i18n('labelInjectionMode')"></span>
+            <select v-for="opt in ['defaultInjectInto']" v-model="settings[opt]" :key="opt">
+              <option v-for="(_, mode) in items[opt]" :key="mode" v-text="mode" />
+            </select>
+            <a class="ml-1" :href="VM_HOME + 'posts/inject-into-context/'" v-bind="EXTERNAL_LINK_PROPS" v-text="i18n('learnInjectionMode')"/>
+          </label>
+          <tooltip :content="i18n('labelXhrInjectHint')">
+            <setting-check name="xhrInject">
+              <locale-group i18n-key="labelXhrInject">
+                <code>page</code>
+              </locale-group> <ruby v-text="i18n('labelXhrInjectNote')"/>
+            </setting-check>
+          </tooltip>
+          <label v-if="!settings.xhrInject">
+            <setting-check name="ffInject"/>
+            <tooltip :content="i18n('labelFastFirefoxInjectHint')">
+              <locale-group i18n-key="labelFastFirefoxInject">
+                <code>page</code>
+              </locale-group>
+            </tooltip>
+          </label>
+        </div>
+        <div class="flex flex-col">
+          <locale-group i18n-key="labelExposeStatus">
             <setting-check v-for="([key, host]) in expose" :key="host"
-                           :name="`expose.${key}`" class="mr-1c valign-tb">
+                           :name="`expose.${key}`" class="ml-2 mr-1c">
               <span v-text="host" />
-              <a :href="`https://${host}`" target="_blank" rel="noopener noreferrer">&nearr;</a>
+              <a :href="`https://${host}`" v-bind="EXTERNAL_LINK_PROPS">&nearr;</a>
             </setting-check>
           </locale-group>
         </div>
+        <setting-check name="helpForLocalFile" :label="i18n('helpForLocalFile')"/>
       </section>
+
       <vm-editor />
-      <vm-template />
+
+      <section>
+        <h3 v-text="i18n('labelScriptTemplate')"/>
+        <p>
+          <!-- eslint-disable-next-line vue/no-v-text-v-html-on-component -->
+          <component v-for="(str, i) in i18n('descScriptTemplate').split(/<(\S+?)>/)" v-text="str"
+                     :key="i" :is="i % 2 ? 'code' : 'span'"
+          /> <vm-date-info/><!--DANGER! Using the same line to preserve the space-->
+        </p>
+        <setting-text :name="kScriptTemplate" has-reset/>
+      </section>
+
       <vm-blacklist />
-      <vm-css />
-    </div>
+
+      <section>
+        <h3 v-text="i18n('labelCustomCSS')"/>
+        <p v-html="i18n('descCustomCSS')"/>
+        <setting-text name="customCSS"/>
+      </section>
+    </details>
   </div>
 </template>
 
 <script>
-import Tooltip from 'vueleton/lib/tooltip/bundle';
-import { debounce } from '#/common';
-import {
-  INJECT_AUTO,
-  INJECT_PAGE,
-  INJECT_CONTENT,
-} from '#/common/consts';
-import SettingCheck from '#/common/ui/setting-check';
-import options from '#/common/options';
-import hookSetting from '#/common/hook-setting';
-import Icon from '#/common/ui/icon';
-import LocaleGroup from '#/common/ui/locale-group';
-import loadZip from '#/common/zip';
+import { i18n } from '@/common';
+import { KNOWN_INJECT_INTO, VM_HOME } from '@/common/consts';
+import options from '@/common/options';
+import { kScriptTemplate, kUpdateEnabledScriptsOnly } from '@/common/options-defaults';
+import { keyboardService } from '@/common/keyboard';
+import { EXTERNAL_LINK_PROPS, focusMe, getActiveElement } from '@/common/ui';
+import { hookSettingsForUI } from '@/common/ui/util';
+import { store } from '@/options/utils';
+
+const items = {
+  autoUpdate: value => Math.max(0, Math.min(365, +value || 0)),
+  defaultInjectInto: { ...KNOWN_INJECT_INTO },
+  showAdvanced: value => value,
+  uiTheme: {
+    '': i18n('optionUiThemeAuto'),
+    dark: i18n('optionUiThemeDark'),
+    light: i18n('optionUiThemeLight'),
+  },
+  xhrInject: value => value,
+};
+</script>
+
+<script setup>
+import { onActivated, onDeactivated, reactive, ref, watch } from 'vue';
+import Tooltip from 'vueleton/lib/tooltip';
+import SettingCheck from '@/common/ui/setting-check';
+import LocaleGroup from '@/common/ui/locale-group';
+import SettingText from '@/common/ui/setting-text';
+import SettingsPopup from '@/common/ui/settings-popup.vue';
 import VmImport from './vm-import';
 import VmExport from './vm-export';
+import VmMaintenance from './vm-maintenance';
 import VmSync from './vm-sync';
 import VmEditor from './vm-editor';
-import VmTemplate from './vm-template';
 import VmBlacklist from './vm-blacklist';
-import VmCss from './vm-css';
+import VmDateInfo from './vm-date-info';
 
-const injectIntoOptions = [
-  INJECT_AUTO,
-  INJECT_PAGE,
-  INJECT_CONTENT,
-];
-const items = [
-  {
-    name: 'showBadge',
-    normalize(value) {
-      if (!value) return '';
-      return value === 'total' ? 'total' : 'unique';
-    },
-  },
-  {
-    name: 'autoUpdate',
-    normalize: value => Math.max(0, Math.min(365, +value || 0)),
-  },
-  {
-    name: 'defaultInjectInto',
-    normalize(value) {
-      return injectIntoOptions.includes(value) ? value : 'auto';
-    },
-  },
-  {
-    name: 'filtersPopup.sort',
-    normalize: value => value === 'exec' && value || 'alpha',
-  },
-];
-const settings = {};
-items.forEach(({ name }) => {
-  settings[name] = null;
+const $el = ref();
+const settings = reactive({});
+const expose = ref();
+const ctrlS = () => getActiveElement().dispatchEvent(new Event('ctrl-s'));
+let revokers;
+
+onActivated(() => {
+  focusMe($el.value);
+  revokers = [
+    keyboardService.register('ctrlcmd-s', ctrlS, { condition: 'inputFocus' }),
+    ...hookSettingsForUI(items, settings, watch, 50),
+  ];
+  expose.value = Object.keys(options.get(EXPOSE)).map(k => [k, decodeURIComponent(k)]);
 });
 
-export default {
-  components: {
-    Icon,
-    VmImport,
-    VmExport,
-    VmSync,
-    VmEditor,
-    VmTemplate,
-    VmBlacklist,
-    VmCss,
-    SettingCheck,
-    LocaleGroup,
-    Tooltip,
-  },
-  data() {
-    return {
-      showAdvanced: false,
-      expose: null,
-      settings,
-      injectIntoOptions,
-    };
-  },
-  computed: {
-    editorWindowHint() {
-      return global.chrome.windows?.onBoundsChanged ? null : this.i18n('optionEditorWindowHint');
-    },
-  },
-  methods: {
-    getUpdater({ name, normalize }) {
-      return (value, oldValue) => {
-        value = normalize(value);
-        oldValue = normalize(oldValue);
-        if (value !== oldValue) options.set(name, value);
-      };
-    },
-  },
-  created() {
-    this.revokers = [];
-    items.forEach((item) => {
-      const { name, normalize } = item;
-      this.revokers.push(hookSetting(name, val => { settings[name] = normalize(val); }));
-      this.$watch(() => settings[name], debounce(this.getUpdater(item), 300));
-    });
-    this.expose = Object.keys(options.get('expose')).map(k => [k, decodeURIComponent(k)]);
-    // Preload zip.js when user visits settings tab
-    loadZip();
-  },
-  beforeDestroy() {
-    this.revokers.forEach((revoke) => { revoke(); });
-  },
-};
+onDeactivated(() => {
+  revokers.forEach(r => r());
+  revokers = null;
+});
 </script>
 
 <style>
 .tab-settings {
   overflow-y: auto;
-  label {
-    display: inline-block;
-    > * {
-      vertical-align: middle;
-    }
-    &.valign-tb * {
-      vertical-align: text-bottom;
-    }
-  }
-  textarea {
-    height: 10em;
-  }
   input[type="number"] {
     width: 3.5em;
     padding-left: .25em;
   }
-}
-.show-advanced {
-  margin: 20px 0;
-  .rotate {
-    transform: rotate(-90deg);
+  h1 {
+    margin-top: 0;
+  }
+  summary {
+    cursor: pointer;
+    margin-left: -1em;
+    user-select: none;
+    &:focus > *,
+    &:hover > * {
+      text-decoration: underline;
+    }
+    h3 {
+      margin-top: 0;
+    }
+  }
+  ruby {
+    color: var(--fill-8);
+  }
+  .icon {
+    width: 16px;
+    height: 16px;
+    fill: var(--fg);
   }
 }
 </style>

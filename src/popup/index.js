@@ -1,74 +1,153 @@
-import Vue from 'vue';
-import { i18n, sendCmdDirectly } from '#/common';
-import { INJECT_PAGE, INJECTABLE_TAB_URL_RE } from '#/common/consts';
-import handlers from '#/common/handlers';
-import { loadScriptIcon } from '#/common/load-script-icon';
-import { forEachValue, mapEntry } from '#/common/object';
-import '#/common/ui/style';
+import '@/common/browser';
+import { sendCmdDirectly } from '@/common';
+import handlers from '@/common/handlers';
+import { loadScriptIcon } from '@/common/load-script-icon';
+import { mapEntry } from '@/common/object';
+import { isTouch, render } from '@/common/ui';
+import '@/common/ui/style';
 import App from './views/app';
-import { mutex, store } from './utils';
+import { emptyStore, store } from './utils';
 
-mutex.init();
-Vue.prototype.i18n = i18n;
+let mutex, mutexResolve, port;
+let hPrev;
 
-const vm = new Vue({
-  render: h => h(App),
-})
-.$mount();
-document.body.append(vm.$el);
+initialize();
+render(App);
 
 Object.assign(handlers, {
-  async SetPopup(data, src) {
-    if (store.currentTab && store.currentTab.id !== src.tab.id) return;
-    /* SetPopup from a sub-frame may come first so we need to wait for the main page
-     * because we only show the iframe menu for unique scripts that don't run in the main page */
-    const isTop = src.frameId === 0;
-    if (!isTop) await mutex.ready;
-    const ids = data.ids.filter(id => !store.scriptIds.includes(id));
-    store.scriptIds.push(...ids);
-    if (isTop) {
-      mutex.resolve();
-      store.commands = data.menus::mapEntry(([, value]) => Object.keys(value).sort());
+  /** Must be synchronous to prevent the wrong visible popup from responding to the message */
+  Run({ reset }, { [kFrameId]: frameId, tab }) {
+    // The tab got reloaded so Run+reset comes right before SetPopup, see cmd-run.js
+    if (reset && !frameId && isMyTab(tab)) {
+      initialize();
     }
-    if (ids.length) {
-      // frameScripts may be appended multiple times if iframes have unique scripts
-      const scope = store[isTop ? 'scripts' : 'frameScripts'];
-      const metas = data.scripts?.filter(({ props: { id } }) => ids.includes(id))
-        || (Object.assign(data, await sendCmdDirectly('GetData', ids))).scripts;
-      metas.forEach(script => loadScriptIcon(script, data.cache));
-      scope.push(...metas);
-      data.failedIds.forEach(id => {
-        scope.forEach((script) => {
-          if (script.props.id === id) {
-            script.failed = true;
-            if (!store.injectionFailure) {
-              store.injectionFailure = { fixable: data.injectInto === INJECT_PAGE };
-            }
-          }
-        });
-      });
+  },
+  /** Must be synchronous to prevent the wrong visible popup from responding to the message */
+  SetPopup(data, src) {
+    if (isMyTab(src.tab)) {
+      return setPopup(data, src);
     }
   },
 });
 
-sendCmdDirectly('CachePop', 'SetPopup').then((data) => {
-  data::forEachValue(val => handlers.SetPopup(...val));
-});
-
-/* Since new Chrome prints a warning when ::-webkit-details-marker is used,
- * we add it only for old Chrome, which is detected via feature added in 89. */
-if (!CSS.supports?.('list-style-type', 'disclosure-open')) {
-  document.styleSheets[0].insertRule('.excludes-menu ::-webkit-details-marker {display:none}');
+async function setPopup(data, { [kFrameId]: frameId, url }) {
+  /* SetPopup from a sub-frame may come first so we need to wait for the main page
+   * because we only show the iframe menu for unique scripts that don't run in the main page */
+  const isTop = frameId === 0;
+  if (!data[MORE]) {
+    Object.assign(data[IDS], await sendCmdDirectly('GetMoreIds', {
+      url,
+      [kTop]: isTop,
+      [IDS]: data[IDS],
+    }));
+  }
+  if (!isTop) await mutex;
+  else {
+    store[IS_APPLIED] = data[INJECT_INTO] !== 'off'; // isApplied at the time of GetInjected
+  }
+  // Ensuring top script's menu wins over a per-frame menu with different commands
+  store.commands = Object.assign(data.menus, !isTop && store.commands);
+  const idMapAllFrames = store.idMap;
+  const idMapMain = idMapAllFrames[0] || (idMapAllFrames[0] = {});
+  const idMapOld = idMapAllFrames[frameId] || (idMapAllFrames[frameId] = {});
+  const idMap = data[IDS]::mapEntry(null, (id, val) => val !== idMapOld[id] && id);
+  const ids = Object.keys(idMap).map(Number);
+  if (ids.length) {
+    Object.assign(idMapOld, idMap);
+    // frameScripts may be appended multiple times if iframes have unique scripts
+    const { frameScripts } = store;
+    const scope = isTop ? store[SCRIPTS] : frameScripts;
+    const metas = data[SCRIPTS]?.filter(({ props: { id } }) => ids.includes(id))
+      || (Object.assign(data, await sendCmdDirectly('GetData', { ids })))[SCRIPTS];
+    metas.forEach(script => {
+      loadScriptIcon(script, data);
+      const { id } = script.props;
+      const state = idMap[id];
+      const more = state === MORE;
+      const badRealm = state === ID_BAD_REALM;
+      const renderedScript = scope.find(({ props }) => props.id === id);
+      if (renderedScript) script = renderedScript;
+      else if (isTop || !(id in idMapMain)) {
+        scope.push(script);
+        if (isTop) { // removing script from frameScripts if it ran there before the main frame
+          const i = frameScripts.findIndex(({ props }) => props.id === id);
+          if (i >= 0) frameScripts.splice(i, 1);
+        }
+      }
+      script.runs = state === CONTENT || state === PAGE;
+      script.pageUrl = url; // each frame has its own URL
+      script.failed = badRealm || state === ID_INJECTING || more;
+      script[MORE] = more;
+      script.syntax = state === ID_INJECTING;
+      if (badRealm && !store.injectionFailure) {
+        store.injectionFailure = { fixable: data[INJECT_INTO] === PAGE };
+      }
+    });
+  }
+  if (isTop) mutexResolve(); // resolving at the end after all `await` above are settled
+  if (!hPrev) {
+    hPrev = Math.max(innerHeight, 100); // ignore the not-yet-resized popup e.g. in Firefox
+    window.onresize = onResize;
+    // Mobile browsers show the popup maximized to the entire screen, no resizing
+    if (isTouch && hPrev > document.body.clientHeight) onResize();
+  }
 }
 
-sendCmdDirectly('GetTabDomain')
-.then(async ({ tab, domain }) => {
-  store.currentTab = tab;
-  store.domain = domain;
-  browser.runtime.connect({ name: `${tab.id}` });
-  if (!INJECTABLE_TAB_URL_RE.test(tab.url)) {
-    store.injectable = false;
-  } else {
-    store.blacklisted = await sendCmdDirectly('TestBlacklist', tab.url);
+function initMutex(delay = 100) {
+  mutex = new Promise(resolve => {
+    mutexResolve = resolve;
+    // pages like Chrome Web Store may forbid injection in main page so we need a timeout
+    setTimeout(resolve, delay);
+  });
+}
+
+async function initialize() {
+  initMutex();
+  Object.assign(store, emptyStore());
+  let [cached, data, [failure, reason, reason2]] = await sendCmdDirectly('InitPopup');
+  if (!reason) {
+    failure = '';
+  } else if (reason === INJECT_INTO) {
+    reason = 'noninjectable';
+    data.injectable = false;
+    mutexResolve();
+  } else if (reason === SKIP_SCRIPTS) {
+    reason = 'scripts-skipped';
+  } else if (reason === IS_APPLIED) {
+    reason = 'scripts-disabled';
+  } else { // blacklisted
+    data[reason] = reason2;
   }
-});
+  Object.assign(store, data, {
+    failure: reason,
+    failureText: failure,
+  });
+  if (cached) {
+    for (const id in cached) handlers.SetPopup(...cached[id]);
+  }
+  if (!port) {
+    port = browser.runtime.connect({ name: `Popup:${cached ? 'C' : ''}:${data.tab.id}` });
+    port.onMessage.addListener(initialize); // for non-injectable tab
+  }
+}
+
+function isMyTab(tab) {
+  // No `tab` is a FF bug when it sends messages from removed iframes
+  return tab && (!store.tab || store.tab.id === tab.id);
+}
+
+function onResize(evt) {
+  const h = innerHeight;
+  if (!evt
+  // ignoring intermediate downsize
+  || h > hPrev
+  // ignoring  initial devicePixelRatio which is based on page zoom in this extension's tabs
+    && document.readyState !== 'loading'
+  // ignoring off-by-1 e.g. due to clientHeight being fractional
+    && document.body.clientHeight - 1 > h
+  ) {
+    window.onresize = null;
+    store.maxHeight = h + 'px';
+  }
+  hPrev = h;
+}

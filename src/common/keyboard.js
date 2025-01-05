@@ -1,4 +1,5 @@
 import { KeyboardService } from '@violentmonkey/shortcut';
+import { getActiveElement } from '@/common/ui';
 
 export * from '@violentmonkey/shortcut';
 
@@ -6,8 +7,8 @@ export const keyboardService = new KeyboardService();
 
 bindKeys();
 
-export function isInput(el) {
-  return ['input', 'textarea'].includes(el?.tagName?.toLowerCase());
+export function isInput({ localName: n } = {}) {
+  return n === 'input' || n === 'button' || n === 'select' || n === 'textarea';
 }
 
 function handleFocus(e) {
@@ -27,10 +28,6 @@ function handleBlur(e) {
   }
 }
 
-function handleEscape() {
-  document.activeElement.blur();
-}
-
 export function toggleTip(el) {
   const event = new CustomEvent('tiptoggle', {
     bubbles: true,
@@ -39,21 +36,12 @@ export function toggleTip(el) {
 }
 
 function bindKeys() {
-  document.addEventListener('focus', handleFocus, true);
-  document.addEventListener('blur', handleBlur, true);
-  keyboardService.register('escape', handleEscape);
-  keyboardService.register('c-[', handleEscape);
+  addEventListener('focus', handleFocus, true);
+  addEventListener('blur', handleBlur, true);
   keyboardService.register('enter', () => {
-    const { activeElement } = document;
-    activeElement.click();
+    getActiveElement().click();
   }, {
     condition: '!inputFocus',
-  });
-  keyboardService.register('?', () => {
-    toggleTip(document.activeElement);
-  }, {
-    condition: '!inputFocus',
-    caseSensitive: true,
   });
 }
 
@@ -62,13 +50,13 @@ function bindKeys() {
  * Ref: https://stackoverflow.com/a/11713537/4238335
  */
 export function handleTabNavigation(dir) {
-  const els = Array.from(document.querySelectorAll('[tabindex="0"],a[href],button,input,select,textarea'))
-  .filter(el => {
+  const els = document.querySelectorAll('[tabindex="0"],a[href],button,input,select,textarea')
+  ::[].filter(el => {
     if (el.tabIndex < 0) return false;
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   });
-  let index = els.indexOf(document.activeElement);
+  let index = els.indexOf(getActiveElement());
   index = (index + dir + els.length) % els.length;
   els[index].focus();
 }

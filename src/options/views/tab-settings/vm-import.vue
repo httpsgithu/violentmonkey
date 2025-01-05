@@ -1,16 +1,14 @@
 <template>
-  <section>
-    <h3 v-text="i18n('labelDataImport')" />
-    <button v-text="i18n('buttonImportData')" @click="pickBackup" ref="buttonImport"/>
-    <button
-      :title="i18n('hintVacuum')"
-      @click="vacuum"
-      :disabled="vacuuming"
-      v-text="labelVacuum"
-    />
-    <div class="mt-1 ml-2c">
-      <setting-check name="importScriptData" :label="i18n('labelImportScriptData')" />
-      <setting-check name="importSettings" :label="i18n('labelImportSettings')" />
+  <div>
+    <button v-text="i18n('buttonImportData')" @click="pickBackup" ref="buttonImport"
+            :disabled="store.batch"/>
+    <button v-text="i18n('buttonUndo') + undoTime" @click="undoImport" class="has-error"
+            :title="i18nConfirmUndoImport"
+            v-if="undoTime" />
+    <div class="mt-1">
+      <setting-check name="importScriptData" :label="labelImportScriptData" />
+      <br>
+      <setting-check name="importSettings" :label="labelImportSettings" />
     </div>
     <table class="import-report">
       <tr v-for="({ type, name, text }, i) in reports" :key="i" :data-type="type">
@@ -18,80 +16,117 @@
         <td v-text="text" :colspan="name ? null : 2"/>
       </tr>
     </table>
-  </section>
+  </div>
 </template>
 
 <script>
-import { ensureArray, i18n, sendCmd } from '#/common';
-import options from '#/common/options';
-import SettingCheck from '#/common/ui/setting-check';
-import loadZipLibrary from '#/common/zip';
-import { showConfirmation, showMessage } from '#/common/ui';
+import { ensureArray, getUniqId, i18n, sendCmdDirectly } from '@/common';
+import { listenOnce } from '@/common/browser';
+import { RUN_AT_RE } from '@/common/consts';
+import options from '@/common/options';
+import loadZipLibrary from '@/common/zip';
+import { showConfirmation } from '@/common/ui';
+import {
+  kDownloadURL, kExclude, kInclude, kMatch, kOrigExclude, kOrigInclude, kOrigMatch,
+  runInBatch, store,
+} from '../../utils';
+</script>
 
-const reports = [];
+<script setup>
+import { onActivated, onMounted, reactive, ref } from 'vue';
+import SettingCheck from '@/common/ui/setting-check';
 
-export default {
-  components: {
-    SettingCheck,
-  },
-  data() {
-    return {
-      reports,
-      vacuuming: false,
-      labelVacuum: this.i18n('buttonVacuum'),
-    };
-  },
-  methods: {
-    pickBackup() {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.zip';
-      input.onchange = () => importBackup(input.files?.[0]);
-      input.click();
-    },
-    async vacuum() {
-      this.vacuuming = true;
-      this.labelVacuum = this.i18n('buttonVacuuming');
-      await sendCmd('Vacuum');
-      this.vacuuming = false;
-      this.labelVacuum = this.i18n('buttonVacuumed');
-    },
-  },
-  mounted() {
-    const toggleDragDrop = initDragDrop(this.$refs.buttonImport);
-    window.addEventListener('hashchange', toggleDragDrop);
-    toggleDragDrop();
-  },
-};
+const reports = reactive([]);
+const buttonImport = ref();
+const undoTime = ref('');
+const i18nConfirmUndoImport = i18n('confirmUndoImport');
+const labelImportScriptData = i18n('labelImportScriptData');
+const labelImportSettings = i18n('labelImportSettings');
+
+let depsPortId;
+let undoPort;
+
+onMounted(() => {
+  const toggleDragDrop = initDragDrop(buttonImport.value);
+  addEventListener('hashchange', toggleDragDrop);
+  toggleDragDrop();
+});
+onActivated(() => {
+  if (++store.isEmpty === 2) {
+    const btn = buttonImport.value;
+    if (btn.getBoundingClientRect().y > innerHeight / 2) {
+      btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    setTimeout(() => btn.focus());
+  }
+});
+
+function pickBackup() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.zip';
+  input.onchange = () => importBackup(input.files?.[0]);
+  input.click();
+}
 
 async function importBackup(file) {
+  if (!store.batch) runInBatch(doImportBackup, file);
+}
+
+async function doImportBackup(file) {
   if (!file) return;
   reports.length = 0;
+  const importScriptData = options.get('importScriptData');
   const zip = await loadZipLibrary();
   const reader = new zip.ZipReader(new zip.BlobReader(file));
   const entries = await reader.getEntries().catch(report) || [];
   if (reports.length) return;
   report('', file.name, 'info');
+  report('', '', 'info'); // deps
   const uriMap = {};
   const total = entries.reduce((n, entry) => n + entry.filename?.endsWith('.user.js'), 0);
   const vmEntry = entries.find(entry => entry.filename?.toLowerCase() === 'violentmonkey');
   const vm = vmEntry && await readContents(vmEntry) || {};
-  if (!vm.scripts) vm.scripts = {};
-  if (!vm.values) vm.values = {};
+  const importSettings = options.get('importSettings') && vm.settings;
+  const scripts = vm.scripts || {};
+  const values = vm.values || {};
+  let now;
+  let depsDone = 0;
+  let depsTotal = 0;
+  depsPortId = getUniqId();
+  chrome.runtime.onConnect.addListener(port => {
+    if (port.name !== depsPortId) return;
+    port.onMessage.addListener(([url, done]) => {
+      if (done) ++depsDone; else ++depsTotal;
+      reports[1].name = i18n('msgLoadingDependency', [depsDone, depsTotal]);
+      if (depsDone === depsTotal) {
+        url = i18n('buttonOK');
+        port.disconnect();
+      } else if (!done) {
+        url += '...';
+      }
+      reports[1].text = url;
+    });
+  });
+  if (!undoPort) {
+    now = ' ⯈ ' + new Date().toLocaleTimeString();
+    undoPort = chrome.runtime.connect({ name: 'undoImport' });
+    await new Promise(resolveOnUndoMessage);
+  }
   await processAll(readScriptOptions, '.options.json');
   await processAll(readScript, '.user.js');
-  if (options.get('importScriptData')) {
+  if (importScriptData) {
     await processAll(readScriptStorage, '.storage.json');
-    sendCmd('SetValueStores',
-      toObjectArray(vm.values, ([uri, store]) => store && ({ where: { uri }, store })));
+    sendCmdDirectly('SetValueStores', values);
   }
-  if (options.get('importSettings')) {
-    sendCmd('SetOptions',
-      toObjectArray(vm.settings, ([key, value]) => key !== 'sync' && { key, value }));
+  if (isObject(importSettings)) {
+    delete importSettings.sync;
+    sendCmdDirectly('SetOptions', importSettings);
   }
-  sendCmd('CheckPosition');
-  showMessage({ text: reportProgress() });
+  sendCmdDirectly('CheckPosition');
   await reader.close();
+  reportProgress();
+  if (now) undoTime.value = now;
 
   function parseJson(text, entry) {
     try {
@@ -115,9 +150,10 @@ async function importBackup(file) {
   }
   async function readScript(entry, code, name) {
     const { filename } = entry;
-    const more = vm.scripts[name];
+    const more = scripts[name];
     const data = {
       code,
+      portId: depsPortId,
       ...more && {
         custom: more.custom,
         config: {
@@ -137,7 +173,7 @@ async function importBackup(file) {
       },
     };
     try {
-      uriMap[name] = (await sendCmd('ParseScript', data)).update.props.uri;
+      uriMap[name] = (await sendCmdDirectly('ParseScript', data)).update.props.uri;
       reportProgress(filename);
     } catch (e) {
       report(e, filename, 'script');
@@ -148,23 +184,22 @@ async function importBackup(file) {
     if (!meta || !opts) return;
     const ovr = opts.override || {};
     reports[0].text = 'Tampermonkey';
-    /** @type VMScript */
-    vm.scripts[name] = {
+    /** @type {VMScript} */
+    scripts[name] = {
       config: {
         enabled: settings.enabled !== false ? 1 : 0,
         shouldUpdate: opts.check_for_updates ? 1 : 0,
       },
       custom: {
-        downloadURL: typeof meta.file_url === 'string' ? meta.file_url : undefined,
-        // customizing of @noframes isn't implemented yet
-        noframes: !!ovr.noframes || (ovr.noframes == null ? undefined : false),
-        runAt: /^document-(start|body|end|idle)$/.test(opts.run_at) ? opts.run_at : undefined,
-        exclude: toStringArray(ovr.use_excludes),
-        include: toStringArray(ovr.use_includes),
-        match: toStringArray(ovr.use_matches),
-        origExclude: ovr.merge_excludes !== false, // will also set to true if absent
-        origInclude: ovr.merge_includes !== false,
-        origMatch: ovr.merge_matches !== false,
+        [kDownloadURL]: typeof meta.file_url === 'string' ? meta.file_url : undefined,
+        noframes: ovr.noframes == null ? undefined : +!!ovr.noframes,
+        runAt: RUN_AT_RE.test(opts.run_at) ? opts.run_at : undefined,
+        [kExclude]: toStringArray(ovr.use_excludes),
+        [kInclude]: toStringArray(ovr.use_includes),
+        [kMatch]: toStringArray(ovr.use_matches),
+        [kOrigExclude]: ovr.merge_excludes !== false, // will also set to true if absent
+        [kOrigInclude]: ovr.merge_includes !== false,
+        [kOrigMatch]: ovr.merge_matches !== false,
       },
       position: +settings.position || undefined,
       props: {
@@ -175,7 +210,7 @@ async function importBackup(file) {
   }
   async function readScriptStorage(entry, json, name) {
     reports[0].text = 'Tampermonkey';
-    vm.values[uriMap[name]] = json.data;
+    values[uriMap[name]] = json.data;
   }
   function report(text, name, type = 'critical') {
     reports.push({ text, name, type });
@@ -187,12 +222,20 @@ async function importBackup(file) {
     reports[0].text = filename;
     return text;
   }
-  function toObjectArray(obj, transform) {
-    return Object.entries(obj || {}).map(transform).filter(Boolean);
-  }
   function toStringArray(data) {
     return ensureArray(data).filter(item => typeof item === 'string');
   }
+}
+
+async function undoImport() {
+  if (!await showConfirmation(i18nConfirmUndoImport)) return;
+  undoTime.value = '';
+  undoPort.postMessage(true);
+  await new Promise(resolveOnUndoMessage);
+}
+
+function resolveOnUndoMessage(resolve) {
+  undoPort.onMessage::listenOnce(resolve);
 }
 
 function initDragDrop(targetElement) {
@@ -212,22 +255,18 @@ function initDragDrop(targetElement) {
   const onDrop = async evt => {
     evt.preventDefault();
     showAllowedState(false);
-    try {
-      // storing it now because `files` will be null after await
-      const file = evt.dataTransfer.files[0];
-      await showConfirmation(i18n('buttonImportData'));
-      targetElement.disabled = true;
-      await importBackup(file);
-      targetElement.disabled = false;
-    } catch (e) { /* NOP */ }
+    // storing it now because `files` will be null after await
+    const file = evt.dataTransfer.files[0];
+    if (!await showConfirmation(i18n('buttonImportData'))) return;
+    await importBackup(file);
   };
   return () => {
-    const isSettingsTab = window.location.hash === '#settings';
-    const onOff = document[`${isSettingsTab ? 'add' : 'remove'}EventListener`];
-    document::onOff('dragend', onDragEnd);
-    document::onOff('dragleave', onDragLeave);
-    document::onOff('dragover', onDragOver);
-    document::onOff('drop', onDrop);
+    const isSettingsTab = store.route.hash === TAB_SETTINGS;
+    const onOff = isSettingsTab ? addEventListener : removeEventListener;
+    onOff('dragend', onDragEnd);
+    onOff('dragleave', onDragLeave);
+    onOff('dragover', onDragOver);
+    onOff('drop', onDrop);
   };
 }
 </script>
@@ -236,6 +275,17 @@ function initDragDrop(targetElement) {
 button.drop-allowed {
   background-color: green;
   color: white;
+  animation: outline-zoom-in .25s cubic-bezier(0, .5, 0, .75);
+}
+@keyframes outline-zoom-in {
+  from {
+    outline: 20px solid rgba(0, 128, 0);
+    outline-offset: 200px;
+  }
+  to {
+    outline: 1px solid rgba(0, 128, 0, 0);
+    outline-offset: 0;
+  }
 }
 .import-report {
   white-space: pre-wrap;

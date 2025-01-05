@@ -1,54 +1,88 @@
-import { request } from '#/common';
-import storage from '#/common/storage';
+import { isCdnUrlRe, isDataUri, isRemote, makeRaw, request } from '@/common';
+import { NO_CACHE } from '@/common/consts';
+import storage from './storage';
+import { getUpdateInterval } from './update';
+import { requestLimited } from './url';
 
-/** @type { function(url, options, check): Promise<void> } or throws on error */
 storage.cache.fetch = cacheOrFetch({
-  init(options) {
-    return { ...options, responseType: 'arraybuffer' };
-  },
-  async transform(response, url, options, check) {
-    const [type, body] = storage.cache.makeRaw(response, true);
-    await check?.(url, response.data, type);
-    return `${type},${body}`;
-  },
+  init: options => ({ ...options, [kResponseType]: 'blob' }),
+  transform: response => makeRaw(response),
 });
 
-/** @type { function(url, options): Promise<void> } or throws on error */
-storage.require.fetch = cacheOrFetch();
+storage.require.fetch = cacheOrFetch({
+  transform: ({ data }, url) => (
+    /^\s*</.test(data)
+      ? Promise.reject(`NOT_JS: ${url} "${data.slice(0, 100).trim().replace(/\s{2,}/g, ' ')}"`)
+      : data
+  ),
+});
 
+storage.code.fetch = cacheOrFetch();
+
+/** @return {VMStorageFetch} */
 function cacheOrFetch(handlers = {}) {
   const requests = {};
   const { init, transform } = handlers;
-  /** @this storage.<area> */
   return function cacheOrFetchHandler(...args) {
     const [url] = args;
     const promise = requests[url] || (requests[url] = this::doFetch(...args));
     return promise;
   };
-  /** @this storage.<area> */
+  /** @this StorageArea */
   async function doFetch(...args) {
     const [url, options] = args;
     try {
-      const res = await request(url, init?.(options) || options);
-      if (await isModified(res, url)) {
+      const res = await requestNewer(url, init ? init(options) : options);
+      if (res) {
         const result = transform ? await transform(res, ...args) : res.data;
-        await this.set(url, result);
+        await this.setOne(url, result);
+        if (options === 'res') {
+          return result;
+        }
       }
-    } catch (err) {
-      if (process.env.DEBUG) console.error(`Error fetching: ${url}`, err);
-      throw err;
     } finally {
       delete requests[url];
     }
   }
 }
 
-async function isModified({ headers }, url) {
-  const mod = headers.get('etag')
-  || +new Date(headers.get('last-modified'))
-  || +new Date(headers.get('date'));
-  if (!mod || mod !== await storage.mod.getOne(url)) {
-    if (mod) await storage.mod.set(url, mod);
-    return true;
+/**
+ * @param {string} url
+ * @param {VMReq.OptionsMulti} [opts]
+ * @return {Promise<VMReq.Response> | void}
+ */
+export async function requestNewer(url, opts) {
+  if (isDataUri(url)) {
+    return;
+  }
+  let multi, modOld, modDate;
+  const isLocal = !isRemote(url);
+  if (!isLocal && opts && (multi = opts[MULTI])
+  && isObject(modOld = await storage.mod.getOne(url))) {
+    [modOld, modDate] = modOld;
+  }
+  if (multi === AUTO && modDate > Date.now() - getUpdateInterval()) {
+    return;
+  }
+  for (const get of multi ? [0, 1] : [1]) {
+    if (modOld || get) {
+      const req = await (isLocal || isCdnUrlRe.test(url) ? request : requestLimited)(url,
+        get ? opts
+          : { ...opts, ...NO_CACHE, method: 'HEAD' });
+      const { headers } = req;
+      const mod = (
+        headers.get('etag')
+        || +new Date(headers.get('last-modified'))
+        || +new Date(headers.get('date'))
+      );
+      if (mod && mod === modOld) {
+        return;
+      }
+      if (get) {
+        if (mod) storage.mod.setOne(url, [mod, Date.now()]);
+        else if (modOld) storage.mod.remove(url);
+        return req;
+      }
+    }
   }
 }
