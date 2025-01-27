@@ -1,262 +1,251 @@
-import { dumpScriptValue, getUniqId, isEmpty } from '#/common/util';
-import {
-  assign, defineProperty, objectEntries, objectKeys, objectPick, objectValues,
-} from '#/common/object';
+import { isEmpty } from '../util';
 import bridge from './bridge';
-import store from './store';
+import { commands, storages } from './store';
 import { onTabCreate } from './tabs';
-import { onRequestCreate } from './requests';
-import { onNotificationCreate } from './notifications';
-import {
-  decodeValue, dumpValue, loadValues, changeHooks,
-} from './gm-values';
-import {
-  charCodeAt, jsonDump, log, logging, slice,
-  createElementNS, setAttribute, NS_HTML,
-} from '../utils/helpers';
+import { onRequestCreate, onRequestInitError } from './requests';
+import { createNotification } from './notifications';
+import { changeHooks, decodeValue, dumpValue } from './gm-values';
 
-const {
-  atob,
-  Blob, Error, TextDecoder, Uint8Array,
-  Array: { prototype: { findIndex, indexOf } },
-  Document: { prototype: { getElementById } },
-  EventTarget: { prototype: { dispatchEvent } },
-  MouseEvent,
-  Promise: { prototype: { then } },
-  RegExp: { prototype: { test } },
-  String: { prototype: { lastIndexOf } },
-  TextDecoder: { prototype: { decode: tdDecode } },
-  URL: { createObjectURL, revokeObjectURL },
-} = global;
-const vmOwnFuncToString = () => '[Violentmonkey property]';
-export const vmOwnFunc = (func, toString) => {
-  defineProperty(func, 'toString', { value: toString || vmOwnFuncToString });
-  return func;
+const resolveOrReturn = (context, val) => (
+  context.async ? promiseResolve(val) : val
+);
+
+/** Name in Greasemonkey4 -> name in GM, all methods are context-bound */
+export const GM4_ALIAS = createNullObj();
+/** Context-bound + async when used as GM.xxx */
+export const GM_API_CTX_GM4ASYNC = {
+  __proto__: null,
+  /** @this {GMContext} */
+  GM_deleteValue(key) {
+    return dumpValue(this, false, [key]);
+  },
+  /** @this {GMContext} */
+  GM_deleteValues(keys) {
+    return dumpValue(this, false, keys);
+  },
+  /** @this {GMContext} */
+  GM_getValue(key, def) {
+    const raw = storages[this.id][key];
+    return resolveOrReturn(this, raw ? decodeValue(raw) : def);
+  },
+  /** @this {GMContext} */
+  GM_getValues(what) {
+    const res = {};
+    const isArr = arrayIsArray(what);
+    const values = storages[this.id];
+    for (const key of isArr ? what : objectKeys(what)) {
+      const raw = values[key];
+      if (raw) setOwnProp(res, key, decodeValue(raw));
+      else if (!isArr) setOwnProp(res, key, what[key]);
+    }
+    return resolveOrReturn(this, res);
+  },
+  /** @this {GMContext} */
+  GM_listValues() {
+    return resolveOrReturn(this, objectKeys(storages[this.id]));
+  },
+  /** @this {GMContext} */
+  GM_setValue(key, val) {
+    return dumpValue(this, true, { [key]: val });
+  },
+  /** @this {GMContext} */
+  GM_setValues(obj) {
+    return dumpValue(this, true, obj);
+  },
+  /**
+   * @this {GMContext}
+   * @param {VMScriptGMDownloadOptions|string} opts
+   * @param {string} [name]
+   */
+  GM_download(opts, name) {
+    if (isString(opts)) {
+      opts = { url: opts, name, __proto__: null };
+    } else if (opts) {
+      opts = nullObjFrom(opts);
+      name = opts.name;
+    }
+    if (!name ? (name = 'missing') : !isString(name) && (name = 'not a string')) {
+      onRequestInitError(opts, new SafeError(`Required parameter "name" is ${name}.`));
+      return;
+    }
+    assign(opts, {
+      [kResponseType]: 'blob',
+      data: null,
+      method: 'GET',
+      overrideMimeType: 'application/octet-stream',
+    });
+    return onRequestCreate(opts, this, name);
+  },
 };
-let downloadChain = Promise.resolve();
 
-export function makeGmApi() {
-  return [{
-    GM_deleteValue(key) {
-      const { id } = this;
-      const values = loadValues(id);
-      const oldRaw = values[key];
-      delete values[key];
-      // using `undefined` to match the documentation and TM for GM_addValueChangeListener
-      dumpValue(id, key, undefined, null, oldRaw);
-    },
-    GM_getValue(key, def) {
-      const raw = loadValues(this.id)[key];
-      return raw ? decodeValue(raw) : def;
-    },
-    GM_listValues() {
-      return objectKeys(loadValues(this.id));
-    },
-    GM_setValue(key, val) {
-      const { id } = this;
-      const raw = dumpScriptValue(val, jsonDump) || null;
-      const values = loadValues(id);
-      const oldRaw = values[key];
-      values[key] = raw;
-      dumpValue(id, key, val, raw, oldRaw);
-    },
-    /**
-     * @callback GMValueChangeListener
-     * @param {String} key
-     * @param {?} oldValue - `undefined` means value was created
-     * @param {?} newValue - `undefined` means value was removed
-     * @param {boolean} remote - `true` means value was modified in another tab
-     */
-    /**
-     * @param {String} key - name of the value to monitor
-     * @param {GMValueChangeListener} fn - callback
-     * @returns {String} listenerId
-     */
-    GM_addValueChangeListener(key, fn) {
-      if (typeof key !== 'string') key = `${key}`;
-      if (typeof fn !== 'function') return;
-      const keyHooks = changeHooks[this.id] || (changeHooks[this.id] = {});
-      const hooks = keyHooks[key] || (keyHooks[key] = {});
-      const i = objectValues(hooks)::indexOf(fn);
-      let listenerId = i >= 0 && objectKeys(hooks)[i];
-      if (!listenerId) {
-        listenerId = getUniqId('VMvc');
-        hooks[listenerId] = fn;
-      }
-      return listenerId;
-    },
-    /**
-     * @param {String} listenerId
-     */
-    GM_removeValueChangeListener(listenerId) {
-      const keyHooks = changeHooks[this.id];
-      if (!keyHooks) return;
-      objectEntries(keyHooks)::findIndex(([key, hooks]) => {
-        if (listenerId in hooks) {
-          delete hooks[listenerId];
-          if (isEmpty(hooks)) delete keyHooks[key];
-          return true;
-        }
-      });
-      if (isEmpty(keyHooks)) delete changeHooks[this.id];
-    },
-    GM_getResourceText(name) {
-      return getResource(this, name);
-    },
-    GM_getResourceURL(name) {
-      return getResource(this, name, true);
-    },
-    GM_registerMenuCommand(cap, func) {
-      const { id } = this;
-      const key = `${id}:${cap}`;
-      store.commands[key] = func;
-      bridge.post('RegisterMenu', [id, cap]);
-      return cap;
-    },
-    GM_unregisterMenuCommand(cap) {
-      const { id } = this;
-      const key = `${id}:${cap}`;
-      delete store.commands[key];
-      bridge.post('UnregisterMenu', [id, cap]);
-    },
-    GM_download(arg1, name) {
-      // not using ... as it calls Babel's polyfill that calls unsafe Object.xxx
-      let opts = {};
-      let onload;
-      if (typeof arg1 === 'string') {
-        opts = { url: arg1, name };
-      } else if (arg1) {
-        name = arg1.name;
-        onload = arg1.onload;
-        opts = objectPick(arg1, [
-          'url',
-          'headers',
-          'timeout',
-          'onerror',
-          'onprogress',
-          'ontimeout',
-        ]);
-      }
-      if (!name || typeof name !== 'string') {
-        throw new Error('Required parameter "name" is missing or not a string.');
-      }
-      assign(opts, {
-        context: { name, onload },
-        method: 'GET',
-        responseType: 'blob',
-        overrideMimeType: 'application/octet-stream',
-        onload: downloadBlob,
-      });
-      return onRequestCreate(opts, this.id);
-    },
-    GM_xmlhttpRequest(opts) {
-      return onRequestCreate(opts, this.id);
-    },
-    GM_addStyle(css) {
-      const id = bridge.sendSync('AddStyle', css);
-      const el = document::getElementById(id);
-      // Mock a Promise without the need for polyfill
-      // It's not actually necessary because DOM messaging is synchronous
-      // but we keep it for compatibility with VM's 2017-2019 behavior
-      // https://github.com/violentmonkey/violentmonkey/issues/217
-      el.then = callback => {
-        // prevent infinite resolve loop
-        delete el.then;
-        callback(el);
-      };
-      return el;
-    },
-    GM_openInTab(url, options) {
-      const data = options && typeof options === 'object' ? options : {
-        active: !options,
-      };
-      data.url = url;
-      return onTabCreate(data);
-    },
-    GM_notification(text, title, image, onclick) {
-      const options = typeof text === 'object' ? text : {
-        text,
-        title,
-        image,
-        onclick,
-      };
-      if (!options.text) {
-        throw new Error('GM_notification: `text` is required!');
-      }
-      const id = onNotificationCreate(options);
-      return {
-        remove: vmOwnFunc(() => bridge.send('RemoveNotification', id)),
-      };
-    },
-    GM_setClipboard(data, type) {
-      bridge.post('SetClipboard', { data, type });
-    },
-    // using the native console.log so the output has a clickable link to the caller's source
-    GM_log: logging.log,
-  }, {
-    // Greasemonkey4 API polyfill
-    getResourceURL: { async: true },
-    getValue: { async: true },
-    deleteValue: { async: true },
-    setValue: { async: true },
-    listValues: { async: true },
-    xmlHttpRequest: { alias: 'xmlhttpRequest' },
-    notification: true,
-    openInTab: true,
-    registerMenuCommand: true,
-    setClipboard: true,
-    addStyle: true, // gm4-polyfill.js sets it anyway
-  }];
-}
-
-function getResource(context, name, isBlob) {
-  const key = context.resources[name];
-  if (key) {
-    let res = isBlob && context.urls[key];
-    if (!res) {
-      const raw = store.cache[context.pathMap[key] || key];
-      if (raw) {
-        const dataPos = raw::lastIndexOf(',');
-        const bin = atob(dataPos < 0 ? raw : raw::slice(dataPos + 1));
-        if (isBlob || /[\x80-\xFF]/::test(bin)) {
-          const len = bin.length;
-          const bytes = new Uint8Array(len);
-          for (let i = 0; i < len; i += 1) {
-            bytes[i] = bin::charCodeAt(i);
-          }
-          if (isBlob) {
-            const type = dataPos < 0 ? '' : raw::slice(0, dataPos);
-            res = createObjectURL(new Blob([bytes], { type }));
-            context.urls[key] = res;
-          } else {
-            res = new TextDecoder()::tdDecode(bytes);
-          }
-        } else { // pure ASCII
-          res = bin;
-        }
-      } else if (isBlob) {
-        res = key;
+/** Context-bound. Methods mirrored to GM4_ALIAS are async when used as GM.xxx */
+export const GM_API_CTX = {
+  __proto__: null,
+  /**
+   * @callback GMValueChangeListener
+   * @param {String} key
+   * @param {?} oldValue - `undefined` means value was created
+   * @param {?} newValue - `undefined` means value was removed
+   * @param {boolean} remote - `true` means value was modified in another tab
+   */
+  /**
+   * @this {GMContext}
+   * @param {String} key - name of the value to monitor
+   * @param {GMValueChangeListener} fn - callback
+   * @returns {String} listenerId
+   */
+  GM_addValueChangeListener(key, fn) {
+    if (!isString(key)) key = `${key}`;
+    if (!isFunction(fn)) return;
+    const hooks = ensureNestedProp(changeHooks, this.id, key);
+    const i = objectValues(hooks)::indexOf(fn);
+    let listenerId = i >= 0 && objectKeys(hooks)[i];
+    if (!listenerId) {
+      listenerId = safeGetUniqId('VMvc');
+      hooks[listenerId] = fn;
+    }
+    return listenerId;
+  },
+  /**
+   * @this {GMContext}
+   * @param {String} listenerId
+   */
+  GM_removeValueChangeListener(listenerId) {
+    const keyHooks = changeHooks[this.id];
+    if (!keyHooks) return;
+    if (process.env.DEBUG) throwIfProtoPresent(keyHooks);
+    for (const key in keyHooks) { /* proto is null */// eslint-disable-line guard-for-in
+      const hooks = keyHooks[key];
+      if (listenerId in hooks) {
+        delete hooks[listenerId];
+        if (isEmpty(hooks)) delete keyHooks[key];
+        break;
       }
     }
-    return res;
+    if (isEmpty(keyHooks)) delete changeHooks[this.id];
+  },
+  /** @this {GMContext} */
+  GM_getResourceText(name) {
+    return getResource(this, name);
+  },
+  GM_getResourceURL: GM4_ALIAS.getResourceUrl = function (name, isBlobUrl) {
+    return getResource(this, name, !!isBlobUrl, isBlobUrl === undefined);
+  },
+  /** @this {GMContext} */
+  GM_registerMenuCommand(text, cb, opts) {
+    opts = nullObjFrom(opts);
+    opts.text = text = `${text}`;
+    if (!text) throw new SafeError('Menu caption text is required!');
+    const { id } = this;
+    const key = opts.id || text;
+    const cmd = ensureNestedProp(commands, id, key);
+    cmd.cb = cb;
+    cmd.text = text;
+    bridge.post('RegisterMenu', { id, key, val: opts });
+    return key;
+  },
+  /** @this {GMContext} */
+  GM_unregisterMenuCommand(key) {
+    const { id } = this;
+    const hub = commands[id];
+    if (hub && (hub[key] || (key = findCommandIdByText(key, hub)))) {
+      delete hub[key];
+      bridge.post('UnregisterMenu', { id, key });
+    }
+  },
+  GM_notification: createNotification,
+  GM_xmlhttpRequest: GM4_ALIAS.xmlHttpRequest = function (opts) {
+    return onRequestCreate(nullObjFrom(opts), this);
+  },
+};
+
+/** Not bound to script context */
+export const GM_API = {
+  __proto__: null,
+  /**
+   * Bypasses site's CSP for inline `style`, `link`, and `script`.
+   * @param {Node} [parent]
+   * @param {string} tag
+   * @param {Object} [attributes]
+   * @returns {HTMLElement} it also has .then() so it should be compatible with TM
+   */
+  GM_addElement(parent, tag, attributes) {
+    return isString(parent)
+      ? webAddElement(null, parent, tag)
+      : webAddElement(parent, tag, attributes);
+  },
+  /**
+   * Bypasses site's CSP for inline `style`.
+   * @param {string} css
+   * @returns {HTMLElement} it also has .then() so it should be compatible with TM and old VM
+   */
+  GM_addStyle(css) {
+    return webAddElement(null, 'style', { textContent: css, id: safeGetUniqId('VMst') });
+  },
+  GM_openInTab(url, options) {
+    options = nullObjFrom(isObject(options) ? options : { active: !options });
+    options.url = url;
+    return onTabCreate(options);
+  },
+  GM_setClipboard(data, type) {
+    bridge.post('SetClipboard', { data, type });
+  },
+  // using the native console.log so the output has a clickable link to the caller's source
+  GM_log: logging.log,
+};
+
+function webAddElement(parent, tag, attrs) {
+  let el;
+  let errorInfo;
+  bridge.call('AddElement', { tag, attrs }, parent, function _(res) {
+    el = this;
+    errorInfo = res;
+  }, 'cbId');
+  // DOM error in content script can't be caught by a page-mode userscript so we rethrow it here
+  if (errorInfo) {
+    const err = new SafeError(errorInfo[0]);
+    err.stack += `\n${errorInfo[1]}`;
+    throw err;
   }
+  /* A Promise polyfill is not actually necessary because DOM messaging is synchronous,
+     but we keep it for compatibility with GM_addStyle in VM of 2017-2019
+     https://github.com/violentmonkey/violentmonkey/issues/217
+     as well as for GM_addElement in Tampermonkey. */
+  return setOwnProp(el, 'then', async cb => (
+    // Preventing infinite resolve loop
+    delete el.then
+    // Native Promise ignores non-function
+    && (isFunction(cb) ? cb(el) : el)
+  ));
 }
 
-function downloadBlob(res) {
-  const { context: { name, onload }, response } = res;
-  const url = createObjectURL(response);
-  const a = document::createElementNS(NS_HTML, 'a');
-  a::setAttribute('href', url);
-  if (name) a::setAttribute('download', name);
-  downloadChain = downloadChain::then(async () => {
-    a::dispatchEvent(new MouseEvent('click'));
-    revokeBlobAfterTimeout(url);
-    try { onload?.(res); } catch (e) { log('error', ['GM_download', 'callback'], e); }
-    await bridge.send('SetTimeout', 100);
-  });
+/**
+ * @param {GMContext} context
+ * @param name
+ * @param isBlob
+ * @param isBlobAuto
+ */
+function getResource(context, name, isBlob, isBlobAuto) {
+  let res;
+  const { id, resCache, resources } = context;
+  const key = resources[name];
+  if (key) {
+    // data URIs aren't cached in bridge, so we'll send them
+    const isData = key::slice(0, 5) === 'data:';
+    const bucketKey = isBlob == null ? 0 : 1 + (isBlob = isBlobAuto ? !isData : isBlob);
+    res = isData && isBlob === false || ensureNestedProp(resCache, bucketKey, key, false);
+    if (!res) {
+      res = bridge.call('GetResource', { id, isBlob, key, raw: isData && key });
+      ensureNestedProp(resCache, bucketKey, key, res);
+    }
+  }
+  return resolveOrReturn(context, res === true ? key : res);
 }
 
-async function revokeBlobAfterTimeout(url) {
-  await bridge.send('SetTimeout', 3000);
-  revokeObjectURL(url);
+function findCommandIdByText(text, hub) {
+  for (const id in hub) {
+    if (hub[id].text === text) {
+      return id;
+    }
+  }
 }

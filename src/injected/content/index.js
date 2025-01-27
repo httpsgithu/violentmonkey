@@ -1,128 +1,108 @@
-import { getUniqId, isEmpty } from '#/common';
-import { INJECT_CONTENT } from '#/common/consts';
-import { objectKeys, objectPick } from '#/common/object';
-import { bindEvents, sendCmd } from '../utils';
-import {
-  forEach, includes, append, createElementNS, setAttribute, NS_HTML,
-} from '../utils/helpers';
-import bridge from './bridge';
-import './clipboard';
-import { appendToRoot, injectPageSandbox, injectScripts } from './inject';
+import bridge, { addBackgroundHandlers, addHandlers, onScripts } from './bridge';
+import { onClipboardCopy } from './clipboard';
+import { injectPageSandbox, injectScripts } from './inject';
 import './notifications';
 import './requests';
 import './tabs';
+import { sendCmd } from './util';
+import { isEmpty } from '../util';
+import { Run, finish } from './cmd-run';
 
-const IS_FIREFOX = !global.chrome.app;
-const IS_TOP = window.top === window;
-const menus = {};
-let isPopupShown;
-let pendingSetPopup;
+const { [IDS]: ids } = bridge;
 
-// Make sure to call obj::method() in code that may run after INJECT_CONTENT userscripts
-const { split } = String.prototype;
-
-(async () => {
-  const contentId = getUniqId();
-  const webId = getUniqId();
-  // injecting right now before site scripts can mangle globals or intercept our contentId
-  // except for XML documents as their appearance breaks, but first we're sending
-  // a request for the data because injectPageSandbox takes ~5ms
-  const dataPromise = sendCmd('GetInjected', null, { retry: true });
+// Make sure to call obj::method() in code that may run after CONTENT userscripts
+async function init() {
   const isXml = document instanceof XMLDocument;
-  if (!isXml) injectPageSandbox(contentId, webId);
+  const xhrData = getXhrInjection();
+  const dataPromise = sendCmd('GetInjected', {
+    /* In FF93 sender.url is wrong: https://bugzil.la/1734984,
+     * in Chrome sender.url is ok, but location.href is wrong for text selection URLs #:~:text= */
+    url: IS_FIREFOX && location.href,
+    // XML document's appearance breaks when script elements are added
+    [FORCE_CONTENT]: isXml,
+    done: !!(xhrData || global.vmData),
+  }, {
+    retry: true,
+  });
   // detecting if browser.contentScripts is usable, it was added in FF59 as well as composedPath
-  const scriptData = IS_FIREFOX && Event.prototype.composedPath
-    ? await getDataFF(dataPromise)
-    : await dataPromise;
-  // 1) bridge.post may be overridden in injectScripts
-  // 2) cloneInto is provided by Firefox in content scripts to expose data to the page
-  bridge.post = bindEvents(contentId, webId, bridge.onHandle, global.cloneInto);
-  bridge.isFirefox = scriptData.isFirefox;
-  bridge.injectInto = scriptData.injectInto;
-  if (scriptData.scripts) injectScripts(contentId, webId, scriptData, isXml);
-  isPopupShown = scriptData.isPopupShown;
-  sendSetPopup();
-  // scriptData is the successor of the two ways to request scripts in Firefox,
-  // but it may not contain everything returned by `GetInjected`, for example `expose`.
-  // Use the slower but more complete `injectData` to continue.
-  const injectData = await dataPromise;
-  if (injectData.expose) bridge.post('Expose');
-})().catch(IS_FIREFOX && console.error); // Firefox can't show exceptions in content scripts
-
-bridge.addBackgroundHandlers({
-  Command(data) {
-    const id = +data::split(':', 1)[0];
-    const realm = bridge.invokableIds::includes(id) && INJECT_CONTENT;
-    bridge.post('Command', data, realm);
-  },
-  PopupShown(state) {
-    isPopupShown = state;
-    sendSetPopup();
-  },
-  UpdatedValues(data) {
-    const dataPage = {};
-    const dataContent = {};
-    const { invokableIds } = bridge;
-    objectKeys(data)::forEach((id) => {
-      (invokableIds::includes(id) ? dataContent : dataPage)[id] = data[id];
-    });
-    if (!isEmpty(dataPage)) bridge.post('UpdatedValues', dataPage);
-    if (!isEmpty(dataContent)) bridge.post('UpdatedValues', dataContent, INJECT_CONTENT);
-  },
-});
-
-bridge.addHandlers({
-  UpdateValue: sendCmd,
-  RegisterMenu(data) {
-    if (IS_TOP) {
-      const [id, cap] = data;
-      const commandMap = menus[id] || (menus[id] = {});
-      commandMap[cap] = 1;
-      sendSetPopup(true);
-    }
-  },
-  UnregisterMenu(data) {
-    if (IS_TOP) {
-      const [id, cap] = data;
-      delete menus[id]?.[cap];
-      sendSetPopup(true);
-    }
-  },
-  AddStyle(css) {
-    const styleId = getUniqId('VMst');
-    const style = document::createElementNS(NS_HTML, 'style');
-    style::setAttribute('id', styleId);
-    style::append(css);
-    appendToRoot(style);
-    return styleId;
-  },
-  CheckScript: sendCmd,
-  SetTimeout: sendCmd,
-  TabFocus: sendCmd,
-});
-
-async function sendSetPopup(isDelayed) {
-  if (isPopupShown) {
-    if (isDelayed) {
-      if (pendingSetPopup) return;
-      // Preventing flicker in popup when scripts re-register menus
-      pendingSetPopup = sendCmd('SetTimeout', 0);
-      await pendingSetPopup;
-      pendingSetPopup = null;
-    }
-    sendCmd('SetPopup', {
-      menus,
-      ...objectPick(bridge, ['ids', 'failedIds', 'injectInto']),
-    });
+  /** @type {VMInjection} */
+  const data = xhrData || (
+    IS_FIREFOX && Event[PROTO].composedPath
+      ? await getDataFF(dataPromise)
+      : await dataPromise
+  );
+  const info = data.info;
+  const injectInto = bridge[INJECT_INTO] = data[INJECT_INTO];
+  assign(ids, data[IDS]);
+  if (IS_FIREFOX && !data.clipFF) {
+    off('copy', onClipboardCopy, true);
   }
+  if (IS_FIREFOX && info) { // must redefine now as it's used by injectPageSandbox
+    IS_FIREFOX = parseFloat(info.ua.browserVersion); // eslint-disable-line no-global-assign
+  }
+  if (data[EXPOSE] != null && !isXml && injectPageSandbox(data)) {
+    addHandlers({ GetScriptVer: true });
+    bridge.post('Expose', data[EXPOSE]);
+  }
+  if (objectKeys(ids).length) {
+    onScripts.forEach(fn => fn(data));
+    await injectScripts(data, info, isXml);
+  }
+  onScripts.length = 0;
+  finish(injectInto);
 }
 
+addBackgroundHandlers({
+  [VIOLENTMONKEY]: () => true,
+}, true);
+
+addBackgroundHandlers({
+  Command: data => bridge.post('Command', data, ids[data.id]),
+  Run: id => Run(id, CONTENT),
+  UpdatedValues(data) {
+    const dataPage = createNullObj();
+    const dataContent = createNullObj();
+    objectKeys(data)::forEach((id) => {
+      (ids[id] === CONTENT ? dataContent : dataPage)[id] = data[id];
+    });
+    if (!isEmpty(dataPage)) bridge.post('UpdatedValues', dataPage);
+    if (!isEmpty(dataContent)) bridge.post('UpdatedValues', dataContent, CONTENT);
+  },
+});
+
+addHandlers({
+  Log: data => safeApply(logging[data[0]], logging, data[1]),
+  TabFocus: REIFY,
+  UpdateValue: REIFY,
+});
+
+init().catch(IS_FIREFOX && logging.error); // Firefox can't show exceptions in content scripts
+
 async function getDataFF(viaMessaging) {
-  const data = window.vmData || await Promise.race([
-    new Promise(resolve => { window.vmResolve = resolve; }),
+  // global !== window in FF content scripts
+  const data = global.vmData || await SafePromise.race([
+    new SafePromise(resolve => { global.vmResolve = resolve; }),
     viaMessaging,
   ]);
-  delete window.vmResolve;
-  delete window.vmData;
+  delete global.vmResolve;
+  delete global.vmData;
   return data;
+}
+
+function getXhrInjection() {
+  try {
+    const quotedKey = `"${INIT_FUNC_NAME}"`;
+    // Accessing document.cookie may throw due to CSP sandbox
+    const cookieValue = document.cookie.split(`${quotedKey}=`)[1];
+    const blobId = cookieValue && cookieValue.split(';', 1)[0];
+    if (blobId) {
+      document.cookie = `${quotedKey}=0; max-age=0; SameSite=Lax`; // this removes our cookie
+      const xhr = new XMLHttpRequest();
+      const url = `blob:${VM_UUID}${blobId}`;
+      xhr.open('get', url, false); // `false` = synchronous
+      xhr.send();
+      URL.revokeObjectURL(url);
+      return JSON.parse(xhr[kResponse]);
+    }
+  } catch { /* NOP */ }
 }

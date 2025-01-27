@@ -31,31 +31,38 @@ function watch() {
 }
 
 async function jsDev() {
-  require('@gera2ld/plaid-webpack/bin/develop')();
+  return runCommand('webpack-cli', ['-w', '--config', 'scripts/webpack.conf.js']);
 }
 
 async function jsProd() {
-  return require('@gera2ld/plaid-webpack/bin/build')({
-    api: true,
-    keep: true,
+  return runCommand('webpack-cli', ['--config', 'scripts/webpack.conf.js']);
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: 'inherit',
+    });
+    child.on('close', (code, signal) => {
+      (code ? reject : resolve)(signal);
+    });
   });
 }
 
 /**
- * Versioning
+ * manifest is already handled in ListBackgroundScriptsPlugin
  *
- * The version of extension is composed of `version` and `beta` fields in `package.json`.
- *
- * Note: prerelease is ignored and not recommended since both Chrome and Firefox do not support semver
- *
+ * This task is only used to tweak dist/manifest.json without rebuilding
  */
 async function manifest() {
-  const data = await buildManifest();
+  const base = JSON.parse(await fs.readFile(`${DIST}/manifest.json`, 'utf8'));
+  const data = await buildManifest(base);
+  await fs.mkdir(DIST).catch(() => {});
   await fs.writeFile(`${DIST}/manifest.json`, JSON.stringify(data), 'utf8');
 }
 
 async function createIcons() {
-  const ALPHA = .5;
+  const ALPHA = 0.5;
   const dist = `${DIST}/public/images`;
   await fs.mkdir(dist, { recursive: true });
   const icon = Sharp(`src/resources/icon${isBeta() ? '-beta' : ''}.png`);
@@ -73,7 +80,7 @@ async function createIcons() {
   ];
   const handle = (size, type = '', image = icon) => {
     let res = image.clone().resize({ width: size });
-    if (size < 48) res = res.sharpen(size < 32 ? .5 : .25);
+    if (size < 48) res = res.sharpen(size < 32 ? 0.5 : 0.25);
     return res.toFile(`${dist}/icon${size}${type}.png`);
   };
   const darkenOuterEdge = async img => img.composite([{
@@ -83,16 +90,18 @@ async function createIcons() {
   const handle16 = async ([type, image]) => {
     const res = image.clone()
     .resize({ width: 18 })
-    .sharpen(.5, 0)
+    .sharpen(0.5, 0)
     .extract({ left: 1, top: 2, width: 16, height: 16 });
     return (type === 'w' ? res : await darkenOuterEdge(res))
     .toFile(`${dist}/icon16${type}.png`);
   };
   return Promise.all([
-    handle(48),
     handle(128),
     ...types.map(handle16),
-    ...[19, 32, 38].flatMap(size => types.map(t => handle(size, ...t))),
+    // 32px dashboard icon (recycled) + 2xDPI browser_action desktop
+    // 38px dashboard icon (normal) + 1.5xDPI browser_action Android
+    // 48px 2xDPI browser_action Android
+    ...[32, 38, 48, 64].flatMap(size => types.map(t => handle(size, ...t))),
   ]);
 }
 
@@ -105,7 +114,7 @@ async function bump() {
   } else {
     pkg.beta = (+pkg.beta || 0) + 1;
   }
-  await fs.writeFile('package.json', JSON.stringify(pkg, null, 2), 'utf8');
+  await fs.writeFile('package.json', JSON.stringify(pkg, null, 2) + '\n', 'utf8');
   if (process.argv.includes('--commit')) {
     const version = `v${getVersion()}`;
     spawn.sync('git', ['commit', '-am', version]);
@@ -127,6 +136,7 @@ function copyI18n() {
     useDefaultLang: true,
     markUntouched: false,
     extension: '.json',
+    stripDescriptions: true,
   })
   .pipe(gulp.dest(`${DIST}/_locales`));
 }
@@ -140,6 +150,7 @@ function updateI18n() {
   .pipe(plumber(logError))
   .pipe(i18n.extract({
     base: 'src/_locales',
+    manifest: 'src/manifest.yml',
     touchedOnly: false,
     useDefaultLang: false,
     markUntouched: true,
@@ -158,15 +169,15 @@ function copyZip() {
     'node_modules/@zip.js/zip.js/dist/zip-no-worker.min.js',
     'node_modules/@zip.js/zip.js/dist/z-worker.js',
   ])
-    .pipe(gulp.dest(`${DIST}/public/lib`));
+  .pipe(gulp.dest(`${DIST}/public/lib`));
 }
 
-const pack = gulp.parallel(manifest, createIcons, copyI18n);
+const pack = gulp.parallel(createIcons, copyI18n, copyZip);
 
 exports.clean = clean;
 exports.manifest = manifest;
-exports.dev = gulp.series(gulp.parallel(copyZip, pack, jsDev), watch);
-exports.build = gulp.series(clean, gulp.parallel(copyZip, pack, jsProd));
+exports.dev = gulp.parallel(gulp.series(pack, watch), jsDev);
+exports.build = gulp.series(clean, gulp.parallel(pack, jsProd));
 exports.i18n = updateI18n;
 exports.check = checkI18n;
 exports.copyI18n = copyI18n;

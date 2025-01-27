@@ -1,12 +1,5 @@
-export const {
-  assign,
-  defineProperty,
-  getOwnPropertyDescriptor: describeProperty,
-  entries: objectEntries,
-  keys: objectKeys,
-  values: objectValues,
-} = Object;
-const { forEach, reduce } = Array.prototype;
+/** @type {boolean} */
+let deepDiff;
 
 export function normalizeKeys(key) {
   if (key == null) return [];
@@ -14,88 +7,90 @@ export function normalizeKeys(key) {
   return `${key}`.split('.').filter(Boolean);
 }
 
-export function objectGet(obj, rawKey, def) {
-  const keys = normalizeKeys(rawKey);
-  let res = obj;
-  keys.every((key) => {
-    if (res && typeof res === 'object' && (key in res)) {
-      res = res[key];
-      return true;
-    }
-    res = def;
-    return false;
-  });
-  return res;
-}
-
-export function objectSet(obj, rawKey, val) {
-  const keys = normalizeKeys(rawKey);
-  if (!keys.length) return val;
-  const root = obj || {};
-  let sub = root;
-  const lastKey = keys.pop();
-  keys.forEach((key) => {
-    sub = sub[key] || (sub[key] = {});
-  });
-  if (typeof val === 'undefined') {
-    delete sub[lastKey];
-  } else {
-    sub[lastKey] = val;
-  }
-  return root;
-}
-
-export function objectPurify(obj) {
-  // Remove keys with undefined values
-  if (Array.isArray(obj)) {
-    obj.forEach(objectPurify);
-  } else if (obj && typeof obj === 'object') {
-    obj::forEachEntry(([key, value]) => {
-      if (typeof value === 'undefined') delete obj[key];
-      else objectPurify(value);
-    });
+export function objectGet(obj, rawKey) {
+  for (const key of normalizeKeys(rawKey)) {
+    if (!obj || typeof obj !== 'object') break;
+    obj = obj[key];
   }
   return obj;
 }
 
-export function objectPick(obj, keys, transform) {
-  return keys::reduce((res, key) => {
-    let value = obj?.[key];
-    if (transform) value = transform(value);
-    if (value != null) res[key] = value;
-    return res;
-  }, {});
+/**
+ * @param {Object} [obj = {}]
+ * @param {string|string[]} [rawKey]
+ * @param {?} [val] - if `undefined` or omitted the value is deleted
+ * @param {boolean} [retParent]
+ * @return {Object} the original object or the parent of `val` if retParent is set
+ */
+export function objectSet(obj, rawKey, val, retParent) {
+  rawKey = normalizeKeys(rawKey);
+  let res = obj || {};
+  let key;
+  for (let i = 0; (key = rawKey[i], i < rawKey.length - 1); i += 1) {
+    res = res[key] || (res[key] = {});
+  }
+  if (val === undefined) {
+    delete res[key];
+  } else {
+    res[key] = val;
+  }
+  return retParent ? res : obj;
 }
 
-// invoked as obj::mapEntry(([key, value], i, allEntries) => transformedValue)
-export function mapEntry(func) {
-  return objectEntries(this)::reduce((res, entry, i, allEntries) => {
-    res[entry[0]] = func(entry, i, allEntries);
-    return res;
-  }, {});
+/**
+ * @param {{}} obj
+ * @param {string[]} keys
+ * @param {function(value,key):?} [transform]
+ * @returns {{}}
+ */
+export function objectPick(obj, keys, transform) {
+  const res = {};
+  for (const key of keys) {
+    let value = obj?.[key];
+    if (transform) value = transform(value, key);
+    if (value !== undefined) res[key] = value;
+  }
+  return res;
+}
+
+/**
+ * @param {function} [fnValue] - (value, newKey, obj) => newValue
+ * @param {function} [fnKey] - (key, val, obj) => newKey (if newKey is falsy the key is skipped)
+ * @param {Object} [thisObj] - passed as `this` to both functions
+ * @return {Object}
+ */
+export function mapEntry(fnValue, fnKey, thisObj) {
+  const res = {};
+  for (let key of Object.keys(this)) {
+    const val = this[key];
+    if (!fnKey || (key = thisObj::fnKey(key, val, this))) {
+      res[key] = fnValue ? thisObj::fnValue(val, key, this) : val;
+    }
+  }
+  return res;
 }
 
 // invoked as obj::forEachEntry(([key, value], i, allEntries) => {})
-export function forEachEntry(func) {
-  if (this) objectEntries(this)::forEach(func);
+export function forEachEntry(func, thisObj) {
+  if (this) Object.entries(this).forEach(func, thisObj);
 }
 
 // invoked as obj::forEachKey(key => {}, i, allKeys)
-export function forEachKey(func) {
-  if (this) objectKeys(this)::forEach(func);
+export function forEachKey(func, thisObj) {
+  if (this) Object.keys(this).forEach(func, thisObj);
 }
 
 // invoked as obj::forEachValue(value => {}, i, allValues)
-export function forEachValue(func) {
-  if (this) objectValues(this)::forEach(func);
+export function forEachValue(func, thisObj) {
+  if (this) Object.values(this).forEach(func, thisObj);
 }
 
-// Needed for Firefox's browser.storage API which fails on Vue observables
 export function deepCopy(src) {
-  return src && (
-    Array.isArray(src) && src.map(deepCopy)
-    || typeof src === 'object' && src::mapEntry(([, val]) => deepCopy(val))
-  ) || src;
+  if (!src || typeof src !== 'object') return src;
+  // Using a literal [] instead of `src.map(deepCopy)` to avoid src `window` leaking.
+  // Using `concat` instead of `for` loop to preserve holes in the array.
+  if (Array.isArray(src)) return [].concat(src).map(deepCopy);
+  return src::mapEntry(deepCopy);
 }
 
 // Simplified deep equality checker
@@ -104,13 +99,88 @@ export function deepEqual(a, b) {
   if (!a || !b || typeof a !== typeof b || typeof a !== 'object') {
     res = a === b;
   } else if (Array.isArray(a)) {
-    res = a.length === b.length
-      && a.every((item, i) => deepEqual(item, b[i]));
+    res = a.length === b.length && a.every((item, i) => deepEqual(item, b[i]));
   } else {
     const keysA = Object.keys(a);
-    const keysB = Object.keys(b);
-    res = keysA.length === keysB.length
-      && keysA.every(key => keysB.includes(key) && deepEqual(a[key], b[key]));
+    /* Not checking hasOwnProperty because 1) we only use own properties and
+     * 2) this can be slow for a large value storage that has thousands of keys */
+    res = keysA.length === Object.keys(b).length
+      && keysA.every(key => deepEqual(a[key], b[key]));
   }
   return res;
+}
+
+/** @return {?} `undefined` if equal */
+export function deepCopyDiff(src, sample) {
+  if (src === sample) return;
+  if (!src || typeof src !== 'object') return src;
+  if (!sample || typeof sample !== 'object') return deepCopy(src);
+  deepDiff = false;
+  src = (Array.isArray(src) ? deepCopyDiffArrays : deepCopyDiffObjects)(src, sample);
+  if (deepDiff) return src;
+}
+
+function deepCopyDiffArrays(src, sample) {
+  const res = [];
+  if (src.length !== sample.length) {
+    deepDiff = true;
+  }
+  for (let i = 0, a, b; i < src.length; i++) {
+    a = src[i];
+    b = sample[i];
+    if (a && typeof a === 'object') {
+      if (b && typeof b === 'object') {
+        a = (Array.isArray(a) ? deepCopyDiffArrays : deepCopyDiffObjects)(a, b);
+      } else {
+        a = deepCopy(a);
+        deepDiff = true;
+      }
+    } else if (a !== b) {
+      deepDiff = true;
+    }
+    res[i] = a;
+  }
+  return res;
+}
+
+function deepCopyDiffObjects(src, sample) {
+  const res = {};
+  for (const key in sample) {
+    if (!hasOwnProperty(src, key)) {
+      deepDiff = true;
+      break;
+    }
+  }
+  for (const key in src) {
+    /* Not using Object.keys and not checking hasOwnProperty because we only use own properties,
+     * and this can be very slow for a large value storage that has thousands of keys */
+    let a = src[key];
+    let b = sample[key];
+    if (a && typeof a === 'object') {
+      if (b && typeof b === 'object') {
+        a = (Array.isArray(a) ? deepCopyDiffArrays : deepCopyDiffObjects)(a, b);
+      } else {
+        a = deepCopy(a);
+        deepDiff = true;
+      }
+    } else if (a !== b) {
+      deepDiff = true;
+    }
+    res[key] = a;
+  }
+  return res;
+}
+
+export function deepSize(val) {
+  if (val === undefined) return 0;
+  if (val === true || val == null) return 4;
+  if (val === false) return 5;
+  if (typeof val === 'string') return val.length + 2; // not counting escapes for \n\r\t and so on
+  if (typeof val !== 'object') return `${val}`.length; // number and whatever
+  if (Array.isArray(val)) return val.reduce((sum, v) => sum + 1 + deepSize(v), 2);
+  return Object.keys(val).reduce((sum, k) => sum + k.length + 4 + deepSize(val[k]), 2);
+}
+
+export function nest(obj, key) {
+  return obj[key] || (obj[key] = {});
 }

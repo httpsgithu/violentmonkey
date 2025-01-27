@@ -1,5 +1,4 @@
-import test from 'tape';
-import { parseMeta } from '#/background/utils/script';
+import { ERR_META_SPACE_INSIDE, parseMeta } from '@/background/utils/script';
 
 const baseMeta = {
   include: [],
@@ -9,11 +8,10 @@ const baseMeta = {
   require: [],
   grant: [],
   resources: {},
-  noframes: false,
 };
 
-test('parseMeta', (t) => {
-  t.deepEqual(parseMeta(`\
+test('parseMeta', () => {
+  expect(parseMeta(`\
 // ==UserScript==
 // @name New Script
 // @namespace Violentmonkey Scripts
@@ -22,7 +20,7 @@ test('parseMeta', (t) => {
 // @match *://*/*
 // @grant none
 // ==/UserScript==
-`), Object.assign({}, baseMeta, {
+`)).toEqual(Object.assign({}, baseMeta, {
     name: 'New Script',
     namespace: 'Violentmonkey Scripts',
     description: 'This is a script',
@@ -30,48 +28,59 @@ test('parseMeta', (t) => {
     match: ['*://*/*'],
     grant: ['none'],
   }));
-  t.deepEqual(parseMeta(`\
+  expect(parseMeta(`\
 // ==UserScript==
 // @name New Script
 // @namespace Violentmonkey Scripts
 // @match *://*/*
 // @noframes
 // ==/UserScript==
-`), Object.assign({}, baseMeta, {
+`)).toEqual(Object.assign({}, baseMeta, {
     name: 'New Script',
     namespace: 'Violentmonkey Scripts',
     match: ['*://*/*'],
     noframes: true,
   }));
-  t.end();
 });
 
-test('parseMetaIrregularities', (t) => {
-  t.deepEqual(parseMeta(`\
+test('parseMetaIrregularities', () => {
+  const baseMetaFoo = {
+    ...baseMeta,
+    name: 'foo',
+  };
+  const parseWeirdMeta = code => {
+    const errors = [];
+    const res = parseMeta(code, { errors });
+    return errors.length ? [res, ...errors] : res;
+  };
+  expect(parseWeirdMeta(`\
   // ==UserScript==============
 // @name foo
  // @namespace bar
 // ==/UserScript===================
-  `), {
-    ...baseMeta,
-    name: 'foo',
+  `)).toEqual({
+    ...baseMetaFoo,
     namespace: 'bar',
   });
-  t.deepEqual(parseMeta(`\
+  expect(parseWeirdMeta(`\
 // ==UserScript==
 //@name foo
-// ==/UserScript==`), baseMeta);
-  t.deepEqual(parseMeta(`\
+// ==/UserScript==`)).toEqual([baseMetaFoo,
+    ERR_META_SPACE_INSIDE + `"//@name foo"`,
+  ]);
+  expect(parseWeirdMeta(`\
 //==UserScript==
 // @name foo
-//\t==/UserScript==`), baseMeta);
-  t.deepEqual(parseMeta(`\
+//\t==/UserScript==`)).toEqual([baseMetaFoo,
+    ERR_META_SPACE_INSIDE + `"//==UserScript=="`,
+    ERR_META_SPACE_INSIDE + String.raw`"//\t==/UserScript=="`,
+  ]);
+  expect(parseWeirdMeta(`\
 /*
 //
   ==UserScript==
 // @name foo
 //
 ==/UserScript==
-*/`), baseMeta);
-  t.end();
+*/`)).toBeFalsy();
 });

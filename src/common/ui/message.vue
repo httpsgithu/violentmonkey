@@ -1,15 +1,26 @@
 <template>
-  <div class="message modal-content" :class="{ multiline: /\n/.test(message.text) }">
-    <div class="mb-1" v-if="message.text" v-text="message.text"></div>
-    <form v-if="message.buttons" @submit.prevent>
-      <input class="mb-1" type="text" v-if="message.input !== false" v-model="message.input">
+  <div class="message modal-content">
+    <div class="message-body">
+      <p v-text="content.title"></p>
+      <p v-text="content.desc" v-if="content.desc"></p>
+    </div>
+    <form v-if="message.buttons" @submit.prevent ref="refForm">
+      <!-- eslint-disable vue/no-mutating-props -->
+      <input
+        class="mb-1"
+        type="text"
+        v-if="message.input !== false"
+        v-model="message.input"
+      />
+      <!-- eslint-enable vue/no-mutating-props -->
       <div class="mr-1c">
         <button
-          v-for="(button, index) in message.buttons"
+          v-for="({text, type, onClick, ...extras}, index) in message.buttons"
           :key="index"
-          :type="button.type || 'button'"
-          v-text="button.text"
-          @click="onButtonClick(button)"
+          :type="type || 'button'"
+          v-text="text"
+          v-bind="extras"
+          @click="onButtonClick(onClick)"
         />
       </div>
     </form>
@@ -17,10 +28,13 @@
 </template>
 
 <script>
+import { computed, nextTick, onMounted, ref } from 'vue';
+import { hasKeyModifiers } from '@/common/ui/index';
+
 const dismissers = [];
 
-window.addEventListener('keydown', (e) => {
-  if (e.keyCode === 27 && dismissers.length) {
+addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && dismissers.length && !hasKeyModifiers(e)) {
     e.stopImmediatePropagation();
     dismissers.pop()();
   }
@@ -28,59 +42,71 @@ window.addEventListener('keydown', (e) => {
 
 export default {
   props: ['message'],
-  created() {
-    dismissers.push(this.dismiss);
-  },
-  mounted() {
-    const input = this.$el.querySelector('input');
-    if (input) {
-      setTimeout(() => {
-        input.focus();
-      });
-    }
-  },
-  beforeDestroy() {
-    const i = dismissers.indexOf(this.dismiss);
-    if (i >= 0) dismissers.splice(i, 1);
-  },
-  methods: {
-    onButtonClick(button) {
-      const { onClick } = button;
+  setup(props, context) {
+    const refForm = ref();
+    const dismiss = () => {
+      dismissers.length = 0;
+      context.emit('dismiss');
+    };
+    const onButtonClick = onClick => {
       if (onClick) {
-        if (onClick(this.message.input) !== false) this.dismiss();
+        if (onClick(props.message.input) !== false) dismiss();
       }
-    },
-    onBackdropClick() {
-      const { onBackdropClick } = this.message;
-      if (onBackdropClick) {
-        if (onBackdropClick() !== false) this.dismiss();
+    };
+    const onBackdropClick = () => {
+      const cb = props.message.onBackdropClick;
+      if (cb && cb() !== false) dismiss();
+    };
+    const content = computed(() => {
+      const { text } = props.message;
+      const sep = text.indexOf('\n\n');
+      if (sep > 0) {
+        return { title: text.slice(0, sep), desc: text.slice(sep + 2) };
       }
-    },
-    dismiss() {
-      this.$emit('dismiss');
-    },
+      return { title: text };
+    });
+
+    onMounted(() => {
+      const el = refForm.value?.querySelector('input, button');
+      if (el) nextTick(() => el.focus());
+      dismissers.push(dismiss);
+      return () => {
+        const i = dismissers.indexOf(dismiss);
+        if (i >= 0) dismissers.splice(i, 1);
+      };
+    });
+
+    return {
+      refForm,
+      content,
+      onButtonClick,
+      onBackdropClick,
+    };
   },
 };
 </script>
 
 <style>
 .message {
-  width: 18rem;
+  max-width: 50vw;
   white-space: pre-wrap;
   overflow-wrap: break-word;
   border-bottom-left-radius: .2rem;
   border-bottom-right-radius: .2rem;
   box-shadow: 0 0 .2rem rgba(0,0,0,.2);
-  &.multiline {
-    width: auto;
-    max-width: 50vw;
-    &::first-line {
-      font-weight: bold;
-      text-decoration: underline;
-    }
-  }
   input {
     width: 100%;
+  }
+  &-body {
+    > p {
+      margin-bottom: 1em;
+      &:nth-last-child(2) { /* matches the first <p> when there are two <p> in multiline mode */
+        font-weight: bold;
+      }
+      &:not(:first-child) {
+        text-align: left;
+      }
+    }
   }
 }
 </style>

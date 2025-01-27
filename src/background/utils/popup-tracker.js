@@ -1,37 +1,99 @@
-import { getActiveTab, sendTabCmd } from '#/common';
+import { getActiveTab, i18n, sendTabCmd } from '@/common';
 import cache from './cache';
-import { getData } from './db';
-import { postInitialize } from './init';
-import { commands } from './message';
+import { getData, getScriptsByURL } from './db';
+import { badges, getFailureReason } from './icon';
+import { addOwnCommands, addPublicCommands, commands } from './init';
 
-export const popupTabs = {}; // { tabId: 1 }
+/** @type {{[tabId: string]: chrome.runtime.Port}} */
+export const popupTabs = {};
+const getCacheKey = tabId => 'SetPopup' + tabId;
 
-postInitialize.push(() => {
-  browser.runtime.onConnect.addListener(onPopupOpened);
-  browser.webRequest.onBeforeRequest.addListener(prefetchSetPopup, {
-    urls: [browser.runtime.getURL(browser.runtime.getManifest().browser_action.default_popup)],
-    types: ['main_frame'],
-  });
+addOwnCommands({
+  async InitPopup() {
+    const tab = await getActiveTab() || {};
+    const { url = '', id: tabId } = tab;
+    const data = commands.GetTabDomain(url);
+    const badgeData = badges[tabId] || {};
+    let failure = getFailureReason(url, badgeData, '');
+    // FF injects content scripts after update/install/reload
+    let reset = !IS_FIREFOX && !failure[0] && badgeData[INJECT] === undefined;
+    let cachedSetPopup = cache.pop(getCacheKey(tabId));
+    if (reset && (cachedSetPopup ? !cachedSetPopup[0] : cachedSetPopup = {})) {
+      cachedSetPopup[0] = await augmentSetPopup(
+        { [IDS]: {}, menus: {} },
+        { tab, url, [kFrameId]: 0, [kTop]: 1 },
+      );
+    }
+    if (!failure[0] && badgeData[INJECT] == null) {
+      if (!await isInjectable(tabId, badgeData)) {
+        failure = getFailureReason('');
+      } else if (reset && (reset = cachedSetPopup[0][0])[SCRIPTS].length) {
+        /* We also show this after the background script is reloaded inside devtools, which keeps
+           the content script connected, but breaks GM_xxxValue, GM_xhr, and so on. */
+        failure = [i18n('failureReasonRestarted'), IS_APPLIED];
+        reset[INJECT_INTO] = 'off';
+      }
+    }
+    data.tab = tab;
+    return [cachedSetPopup, data, failure];
+  },
 });
 
+addPublicCommands({
+  /** Must be synchronous for proper handling of `return;` inside */
+  SetPopup(data, src) {
+    const tabId = src.tab.id;
+    const key = getCacheKey(tabId);
+    if (popupTabs[tabId]) {
+      return; // allowing the visible popup's onMessage to handle this message
+    }
+    augmentSetPopup(data, src, key);
+  }
+});
+
+browser.runtime.onConnect.addListener(onPopupOpened);
+browser.webRequest.onBeforeRequest.addListener(prefetchSetPopup, {
+  urls: [chrome.runtime.getURL(extensionManifest[BROWSER_ACTION].default_popup)],
+  types: ['main_frame'],
+});
+
+async function augmentSetPopup(data, src, key) {
+  data[MORE] = true;
+  const ids = data[IDS];
+  const moreIds = getScriptsByURL(src.url, src[kTop], null, ids);
+  Object.assign(ids, moreIds);
+  Object.assign(data, await getData({ [IDS]: Object.keys(ids) }));
+  data = [data, src];
+  if (!key) return data;
+  (cache.get(key) || cache.put(key, {}))[src[kFrameId]] = data;
+}
+
+async function isInjectable(tabId, badgeData) {
+  return badgeData[INJECT]
+    && await sendTabCmd(tabId, VIOLENTMONKEY, null, { [kFrameId]: 0 })
+    || (
+      await browser.tabs.executeScript(tabId, { code: '1', [RUN_AT]: 'document_start' })
+      .catch(() => [])
+    )[0];
+}
+
 function onPopupOpened(port) {
-  const tabId = +port.name;
-  popupTabs[tabId] = 1;
-  sendTabCmd(tabId, 'PopupShown', true);
-  port.onDisconnect.addListener(onPopupClosed);
-  delete commands.SetPopup;
+  const [cmd, cached, tabId] = port.name.split(':');
+  if (cmd !== 'Popup') return;
+  if (!cached) notifyTab(+tabId, true);
+  popupTabs[tabId] = port;
+  port.onDisconnect.addListener(() => {
+    delete popupTabs[tabId];
+    notifyTab(+tabId, false);
+  });
 }
 
-function onPopupClosed({ name }) {
-  delete popupTabs[name];
-  sendTabCmd(+name, 'PopupShown', false);
+function prefetchSetPopup() {
+  getActiveTab().then(t => t && notifyTab(t.id, true));
 }
 
-async function prefetchSetPopup() {
-  const tabId = (await getActiveTab()).id;
-  sendTabCmd(tabId, 'PopupShown', true);
-  commands.SetPopup = async (data, src) => {
-    Object.assign(data, await getData(data.ids));
-    cache.put('SetPopup', Object.assign({ [src.frameId]: [data, src] }, cache.get('SetPopup')));
-  };
+function notifyTab(tabId, data) {
+  if (badges[tabId]) {
+    sendTabCmd(tabId, 'PopupShown', data);
+  }
 }

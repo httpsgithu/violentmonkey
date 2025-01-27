@@ -1,126 +1,143 @@
-import { isEmpty, sendTabCmd } from '#/common';
-import { forEachEntry, forEachKey, objectSet } from '#/common/object';
-import { getScript, getValueStoresByIds, dumpValueStores } from './db';
-import { commands } from './message';
+import { isEmpty, makePause, sendTabCmd } from '@/common';
+import { forEachEntry, forEachValue, nest, objectGet, objectSet } from '@/common/object';
+import { getScript } from './db';
+import { addOwnCommands, addPublicCommands } from './init';
+import storage, { S_VALUE, S_VALUE_PRE } from './storage';
+import { cachedStorageApi } from './storage-cache';
+import { getFrameDocIdAsObj, getFrameDocIdFromSrc } from './tabs';
 
-const openers = {}; // { scriptId: { tabId: { frameId: 1, ... }, ... } }
-let cache = {}; // { scriptId: { key: { last: value, tabId: { frameId: value } } } }
-let updateScheduled;
+/** { scriptId: { tabId: { frameId: {key: raw}, ... }, ... } } */
+const openers = {};
+let chain;
+let toSend = {};
 
-Object.assign(commands, {
-  /** @return {Promise<Object>} */
-  async GetValueStore(id) {
-    const stores = await getValueStoresByIds([id]);
-    return stores[id] || {};
+addOwnCommands({
+  async GetValueStore(id, { tab }) {
+    const frames = nest(nest(openers, id), tab.id);
+    const values = frames[0] || (frames[0] = await storage[S_VALUE].getOne(id));
+    return values;
   },
-  /** @param {{ where, store }[]} data
-   * @return {Promise<void>} */
-  async SetValueStores(data) {
-    // Value store will be replaced soon.
-    const stores = data.reduce((res, { where, store }) => {
-      const id = where.id || getScript(where)?.props.id;
-      if (id) res[id] = store;
-      return res;
-    }, {});
-    await Promise.all([
-      dumpValueStores(stores),
-      broadcastValueStores(groupStoresByFrame(stores)),
-    ]);
-  },
-  /** @return {void} */
-  UpdateValue({ id, key, value = null }, src) {
-    objectSet(cache, [id, key, 'last'], value);
-    objectSet(cache, [id, key, src.tab.id, src.frameId], value);
-    updateLater();
+  /**
+   * @param {Object} data - key can be an id or a uri
+   */
+  SetValueStores(data) {
+    const toWrite = {};
+    data::forEachEntry(([id, store = {}]) => {
+      id = getScript({ id: +id, uri: id })?.props.id;
+      if (id) {
+        toWrite[S_VALUE_PRE + id] = store;
+        toSend[id] = store;
+      }
+    });
+    commit(toWrite, cachedStorageApi);
   },
 });
 
-browser.tabs.onRemoved.addListener(resetValueOpener);
-browser.tabs.onReplaced.addListener((addedId, removedId) => resetValueOpener(removedId));
+addPublicCommands({
+  UpdateValue(what, src) {
+    const res = {};
+    for (const id in what) {
+      const values = objectGet(openers, [id, src.tab.id, getFrameDocIdFromSrc(src)]);
+      // preventing the weird case of message arriving after the page navigated
+      if (!values) return;
+      const hub = nest(toSend, id);
+      const data = what[id];
+      for (const key in data) {
+        const raw = data[key];
+        if (raw) values[key] = raw; else delete values[key];
+        hub[key] = raw || null;
+      }
+      res[id] = values;
+    }
+    commit(res);
+  },
+});
 
-export function resetValueOpener(tabId) {
-  openers::forEachEntry(([id, openerTabs]) => {
-    if (tabId in openerTabs) {
-      delete openerTabs[tabId];
-      if (isEmpty(openerTabs)) delete openers[id];
+export function clearValueOpener(tabId, frameId) {
+  if (tabId == null) {
+    toSend = {};
+  }
+  openers::forEachEntry(([id, tabs]) => {
+    const frames = tabs[tabId];
+    if (frames) {
+      if (frameId) {
+        delete frames[frameId];
+        if (isEmpty(frames)) delete tabs[tabId];
+      } else {
+        delete tabs[tabId];
+      }
+    }
+    if (tabId == null || isEmpty(tabs)) {
+      delete openers[id];
     }
   });
 }
 
-export function addValueOpener(tabId, frameId, scriptIds) {
-  scriptIds.forEach((id) => {
-    objectSet(openers, [id, tabId, frameId], 1);
-  });
-}
-
-async function updateLater() {
-  while (!updateScheduled) {
-    updateScheduled = true;
-    await 0;
-    const currentCache = cache;
-    cache = {};
-    await doUpdate(currentCache);
-    updateScheduled = false;
-    if (isEmpty(cache)) break;
+/**
+ * @param {VMInjection.Script[] | number[]} injectedScripts
+ * @param {number} tabId
+ * @param {number|string} frameId
+ */
+export async function addValueOpener(injectedScripts, tabId, frameId) {
+  const valuesById = +injectedScripts[0] // restoring storage for page from bfcache
+    && await storage[S_VALUE].getMulti(injectedScripts);
+  for (const script of injectedScripts) {
+    const id = valuesById ? script : script.id;
+    const values = valuesById ? valuesById[id] || null : script[VALUES];
+    if (values) objectSet(openers, [id, tabId, frameId], Object.assign({}, values));
+    else delete openers[id];
   }
 }
 
-async function doUpdate(currentCache) {
-  const ids = Object.keys(currentCache);
-  const valueStores = await getValueStoresByIds(ids);
-  ids.forEach((id) => {
-    currentCache[id]::forEachEntry(([key, { last }]) => {
-      objectSet(valueStores, [id, key], last || undefined);
+/** Moves values of a pre-rendered page identified by documentId to frameId:0 */
+export function reifyValueOpener(ids, documentId) {
+  for (const id of ids) {
+    openers[id]::forEachValue(frames => {
+      if (documentId in frames) {
+        frames[0] = frames[documentId];
+        delete frames[documentId];
+      }
     });
-  });
-  await Promise.all([
-    dumpValueStores(valueStores),
-    broadcastValueStores(groupCacheByFrame(currentCache), { partial: true }),
-  ]);
+  }
 }
 
-async function broadcastValueStores(tabFrameData, { partial } = {}) {
-  const tasks = [];
-  for (const [tabId, frames] of Object.entries(tabFrameData)) {
-    for (const [frameId, frameData] of Object.entries(frames)) {
-      if (!isEmpty(frameData)) {
-        if (partial) frameData.partial = true;
-        tasks.push(sendTabCmd(+tabId, 'UpdatedValues', frameData, { frameId: +frameId }));
-        if (tasks.length === 20) await Promise.all(tasks.splice(0)); // throttling
+function commit(data, api) {
+  (api || storage[S_VALUE]).set(data, !!api);
+  chain = chain?.catch(console.warn).then(broadcast)
+    || broadcast();
+}
+
+async function broadcast() {
+  const toTabs = {};
+  let num = 0;
+  toSend::forEachEntry(groupByTab, toTabs);
+  toSend = {};
+  for (const [tabId, frames] of Object.entries(toTabs)) {
+    for (const [frameId, toFrame] of Object.entries(frames)) {
+      if (!isEmpty(toFrame)) {
+        // Not awaiting because the tab may be busy/sleeping
+        sendTabCmd(+tabId, 'UpdatedValues', toFrame, getFrameDocIdAsObj(frameId));
+        if (!(++num % 20)) await makePause(); // throttling
       }
     }
   }
-  await Promise.all(tasks);
+  chain = null;
 }
 
-// Returns per tab/frame data with only the changed values
-function groupCacheByFrame(cacheData) {
-  const toSend = {};
-  cacheData::forEachEntry(([id, scriptData]) => {
-    const dataEntries = Object.entries(scriptData);
-    openers[id]::forEachEntry(([tabId, frames]) => {
-      frames::forEachKey((frameId) => {
-        dataEntries.forEach(([key, history]) => {
-          // Skipping this frame if its last recorded value is identical
-          if (history.last !== history[tabId]?.[frameId]) {
-            objectSet(toSend, [tabId, frameId, id, key], history.last);
-          }
-        });
+/** @this {Object} accumulator */
+function groupByTab([id, valuesToSend]) {
+  const entriesToSend = Object.entries(valuesToSend);
+  openers[id]::forEachEntry(([tabId, frames]) => {
+    if (tabId < 0) return; // script values editor watches for changes differently
+    const toFrames = nest(this, tabId);
+    frames::forEachEntry(([frameId, last]) => {
+      const toScript = nest(nest(toFrames, frameId), id);
+      entriesToSend.forEach(([key, raw]) => {
+        if (raw !== last[key]) {
+          if (raw) last[key] = raw; else delete last[key];
+          toScript[key] = raw;
+        }
       });
     });
   });
-  return toSend;
-}
-
-// Returns per tab/frame data
-function groupStoresByFrame(stores) {
-  const toSend = {};
-  stores::forEachEntry(([id, store]) => {
-    openers[id]::forEachEntry(([tabId, frames]) => {
-      frames::forEachKey(frameId => {
-        objectSet(toSend, [tabId, frameId, id], store);
-      });
-    });
-  });
-  return toSend;
 }

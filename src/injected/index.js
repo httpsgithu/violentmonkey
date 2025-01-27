@@ -1,38 +1,45 @@
-import { sendCmd } from './utils';
+import browser from '@/common/browser'; // eslint-disable-line no-restricted-imports
+import { sendCmd } from './content/util';
+import { USERSCRIPT_META_INTRO } from './util';
 import './content';
 
 // Script installation in Firefox as it does not support `onBeforeRequest` for `file:`
-if (!global.chrome.app
-&& global.top === window
-&& global.location.protocol === 'file:'
-&& global.location.pathname.endsWith('.user.js')) {
+// Using pathname and a case-sensitive check to match webRequest `urls` filter behavior
+if (IS_FIREFOX && topRenderMode === 1
+&& location.protocol === 'file:'
+&& location.pathname.endsWith('.user.js')
+&& document.contentType === 'application/x-javascript' // FF uses this for file: scheme
+) {
   (async () => {
     const {
-      browser,
       fetch,
       history,
-      document: { referrer },
-      Response: { prototype: { text: getText } },
-      location: { href: url },
     } = global;
-    const fetchOpts = { mode: 'same-origin' };
-    const response = await fetch(url, fetchOpts);
-    if (!/javascript|^text\/plain|^$/.test(response.headers.get('content-type') || '')) {
-      return;
-    }
-    let code = await response.text();
-    if (!/==userscript==/i.test(code)) {
+    const { referrer } = document;
+    const { text: getText } = ResponseProto;
+    const isFF68 = 'cookie' in Document[PROTO];
+    const url = location.href;
+    const fetchCode = async () => (await fetch(url, { mode: 'same-origin' }))::getText();
+    let code = await fetchCode();
+    let busy;
+    let oldCode;
+    if (code::stringIndexOf(USERSCRIPT_META_INTRO) < 0) {
       return;
     }
     await sendCmd('ConfirmInstall', { code, url, from: referrer });
     // FF68+ doesn't allow extension pages to get file: URLs anymore so we need to track it here
     // (detecting FF68 by a feature because we can't use getBrowserInfo here and UA may be altered)
-    if (browser.storage.managed) {
+    if (isFF68) {
+      /** @param {chrome.runtime.Port} */
       browser.runtime.onConnect.addListener(port => {
         if (port.name !== 'FetchSelf') return;
-        let oldCode;
         port.onMessage.addListener(async () => {
-          code = await (await fetch(url, fetchOpts))::getText();
+          try {
+            if (busy) await busy;
+            code = await (busy = fetchCode());
+          } finally {
+            busy = false;
+          }
           if (code === oldCode) {
             code = null;
           } else {
@@ -40,7 +47,13 @@ if (!global.chrome.app
           }
           port.postMessage(code);
         });
-        port.onDisconnect.addListener(closeSelf);
+        port.onDisconnect.addListener(async () => {
+          oldCode = null;
+          // The user may have reloaded the Confirm page so let's check
+          if (!await sendCmd('CheckInstallerTab', port.sender.tab.id)) {
+            closeSelf();
+          }
+        });
       });
     } else {
       closeSelf();
@@ -52,5 +65,5 @@ if (!global.chrome.app
         sendCmd('TabClose');
       }
     }
-  })().catch(console.error); // FF doesn't show exceptions in content scripts
+  })().catch(logging.error); // FF doesn't show exceptions in content scripts
 }

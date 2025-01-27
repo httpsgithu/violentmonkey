@@ -1,18 +1,20 @@
-import { sendCmd } from '../utils';
-import bridge from './bridge';
+import bridge, { addBackgroundHandlers, addHandlers } from './bridge';
+import { sendCmd } from './util';
 
-const tabIds = {};
-const tabKeys = {};
-const realms = {};
+const tabIds = createNullObj();
+const tabKeys = createNullObj();
+const realms = createNullObj();
 
-bridge.addHandlers({
+addHandlers({
   async TabOpen({ key, data }, realm) {
+    await bridge[REIFY];
     const { id } = await sendCmd('TabOpen', data);
     tabIds[key] = id;
     tabKeys[id] = key;
     realms[id] = realm;
   },
-  TabClose(key) {
+  async TabClose(key) {
+    await bridge[REIFY];
     const id = tabIds[key];
     // !key => close current tab
     // id => close tab by id
@@ -20,7 +22,7 @@ bridge.addHandlers({
   },
 });
 
-bridge.addBackgroundHandlers({
+addBackgroundHandlers({
   TabClosed(id) {
     const key = tabKeys[id];
     const realm = realms[id];

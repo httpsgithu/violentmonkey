@@ -1,9 +1,13 @@
 {
   "compilerOptions": {
     "baseUrl": ".",
+    "jsx": "preserve",
     "paths": {
-      "#/*": ["./src/*"]
+      "@/*": ["./src/*"]
     }
   },
-  "exclude": ["node_modules"]
+  "typeAcquisition": {
+    "include": ["./types.d.ts"]
+  },
+  "exclude": ["node_modules", "dist"]
 }

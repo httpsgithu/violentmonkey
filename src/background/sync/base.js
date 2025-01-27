@@ -1,12 +1,13 @@
 import {
   debounce, normalizeKeys, request, noop, makePause, ensureArray, sendCmd,
-} from '#/common';
-import { TIMEOUT_HOUR } from '#/common/consts';
+  buffer2string, getRandomString,
+} from '@/common';
+import { TIMEOUT_HOUR } from '@/common/consts';
 import {
-  forEachEntry, objectSet, objectPick, objectPurify,
-} from '#/common/object';
+  forEachEntry, objectSet, objectPick,
+} from '@/common/object';
 import {
-  getEventEmitter, getOption, setOption, hookOptions,
+  getEventEmitter, getOption, setOption,
 } from '../utils';
 import {
   sortScripts,
@@ -49,7 +50,7 @@ function initConfig() {
   function get(key, def) {
     const keys = normalizeKeys(key);
     keys.unshift('sync');
-    return getOption(keys, def);
+    return getOption(keys) ?? def;
   }
   function set(key, value) {
     const keys = normalizeKeys(key);
@@ -78,7 +79,7 @@ function serviceConfig(name) {
     return syncConfig.get(getKeys(key), def);
   }
   function set(key, val) {
-    if (typeof key === 'object') {
+    if (isObject(key)) {
       key::forEachEntry(([k, v]) => {
         syncConfig.set(getKeys(k), v);
       });
@@ -175,6 +176,19 @@ function parseScriptData(raw) {
   return data;
 }
 
+function objectPurify(obj) {
+  // Remove keys with undefined values
+  if (Array.isArray(obj)) {
+    obj.forEach(objectPurify);
+  } else if (isObject(obj)) {
+    obj::forEachEntry(([key, value]) => {
+      if (typeof value === 'undefined') delete obj[key];
+      else objectPurify(value);
+    });
+  }
+  return obj;
+}
+
 function serviceFactory(base) {
   const Service = function constructor() {
     this.initialize();
@@ -196,7 +210,7 @@ export const BaseService = serviceFactory({
   displayName: 'BaseService',
   delayTime: 1000,
   urlPrefix: '',
-  metaFile: 'Violentmonkey',
+  metaFile: VIOLENTMONKEY,
   properties: {
     authType: 'oauth',
   },
@@ -210,6 +224,7 @@ export const BaseService = serviceFactory({
     this.config = serviceConfig(this.name);
     this.authState = serviceState([
       'idle',
+      'no-auth',
       'initializing',
       'authorizing', // in case some services require asynchronous requests to get access_tokens
       'authorized',
@@ -266,16 +281,17 @@ export const BaseService = serviceFactory({
   prepareHeaders() {
     this.headers = {};
   },
-  prepare() {
+  prepare(promise) {
     this.authState.set('initializing');
-    return (this.initToken() ? Promise.resolve(this.user()) : Promise.reject({
-      type: 'unauthorized',
+    return Promise.resolve(promise)
+    .then(() => this.initToken() ? this.user() : Promise.reject({
+      type: 'no-auth',
     }))
     .then(() => {
       this.authState.set('authorized');
     }, (err) => {
-      if (err && err.type === 'unauthorized') {
-        this.authState.set('unauthorized');
+      if (['no-auth', 'unauthorized'].includes(err?.type)) {
+        this.authState.set(err.type);
       } else {
         console.error(err);
         this.authState.set('error');
@@ -284,8 +300,8 @@ export const BaseService = serviceFactory({
       throw err;
     });
   },
-  checkSync() {
-    return this.prepare()
+  checkSync(promise) {
+    return this.prepare(promise)
     .then(() => this.startSync());
   },
   user: noop,
@@ -540,7 +556,7 @@ export function initialize() {
       services[name] = service;
     });
   }
-  sync();
+  return sync();
 }
 
 function syncOne(service) {
@@ -548,23 +564,17 @@ function syncOne(service) {
   if (service.authState.is(['idle', 'error'])) return service.checkSync();
   if (service.authState.is('authorized')) return service.startSync();
 }
+
 export function sync() {
   const service = getService();
   return service && Promise.resolve(syncOne(service)).then(autoSync);
-}
-
-export function checkAuthUrl(url) {
-  return serviceNames.some((name) => {
-    const service = services[name];
-    const authorized = service.checkAuth && service.checkAuth(url);
-    return authorized;
-  });
 }
 
 export function authorize() {
   const service = getService();
   if (service) service.authorize();
 }
+
 export function revoke() {
   const service = getService();
   if (service) service.revoke();
@@ -578,7 +588,66 @@ export function setConfig(config) {
   }
 }
 
-hookOptions((data) => {
-  const value = data?.['sync.current'];
-  if (value) initialize();
-});
+let unregister;
+
+export async function openAuthPage(url, redirectUri) {
+  unregister?.(); // otherwise our new tabId will be ignored
+  const tabId = (await browser.tabs.create({ url })).id;
+  /**
+   * @param {chrome.webRequest.WebResponseDetails} info
+   * @returns {chrome.webRequest.BlockingResponse}
+   */
+  const handler = (info) => {
+    if (getService().checkAuth?.(info.url)) {
+      // When onBeforeRequest occurs for initial requests intercepted by service worker,
+      // info.tabId will be -1 on Chromium based browsers, use tabId instead.
+      // tested on Chrome / Edge / Brave
+      browser.tabs.remove(tabId);
+      // If we unregister without setTimeout, API will ignore { cancel: true }
+      setTimeout(unregister, 0);
+      return { cancel: true };
+    }
+  };
+  unregister = () => {
+    browser.webRequest.onBeforeRequest.removeListener(handler);
+  };
+  // Note: match pattern does not support port number
+  // - In Chrome, the port number is ignored and the pattern still works
+  // - In Firefox, the pattern is ignored and won't match any URL
+  redirectUri = redirectUri.replace(/:\d+/, '');
+  browser.webRequest.onBeforeRequest.addListener(handler, {
+    // Do not filter by tabId here, see above
+    urls: [`${redirectUri}*`],
+    types: ['main_frame', 'xmlhttprequest'], // fetch request in service worker
+  }, ['blocking']);
+}
+
+const base64urlMapping = {
+  '+': '-',
+  '/': '_',
+};
+
+async function sha256b64url(code) {
+  const bin = new TextEncoder().encode(code);
+  const buffer = await crypto.subtle.digest('SHA-256', bin);
+  const b64 = btoa(buffer2string(buffer));
+  return b64.replace(/[+/=]/g, m => base64urlMapping[m] || '');
+}
+
+/**
+ * Create a unique string between 43 and 128 characters long.
+ *
+ * Ref: RFC 7636
+ */
+export function getCodeVerifier() {
+  return getRandomString(43, 128);
+}
+
+export async function getCodeChallenge(codeVerifier) {
+  const method = 'S256';
+  const challenge = await sha256b64url(codeVerifier);
+  return {
+    code_challenge: challenge,
+    code_challenge_method: method,
+  };
+}

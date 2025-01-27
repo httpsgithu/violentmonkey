@@ -1,28 +1,20 @@
 <template>
   <section>
-    <h3 v-text="i18n('labelBlacklist')"></h3>
+    <h3 v-text="i18n('labelBlacklist')"/>
     <p>
-      {{i18n('descBlacklist')}}
-      <a href="https://violentmonkey.github.io/posts/smart-rules-for-blacklist/#blacklist-patterns" target="_blank" rel="noopener noreferrer" v-text="i18n('learnBlacklist')"></a>
+      <a :href="VM_HOME + 'posts/smart-rules-for-blacklist/#blacklist-patterns'"
+         v-text="i18n('learnBlacklist')" v-bind="EXTERNAL_LINK_PROPS"/>
     </p>
-    <setting-text name="blacklist" @save="onSave"/>
+    <VmBlacklistBody :name="BLACKLIST" :desc="i18n('descBlacklist')"/>
+    <VmBlacklistBody :name="BLACKLIST_NET" :desc="i18n('descBlacklistNet')"/>
   </section>
 </template>
 
 <script>
-import { sendCmd } from '#/common';
-import { showMessage } from '#/common/ui';
-import SettingText from '#/common/ui/setting-text';
+import { BLACKLIST, BLACKLIST_NET, VM_HOME } from '@/common/consts';
+import { EXTERNAL_LINK_PROPS } from '@/common/ui';
+</script>
 
-export default {
-  components: {
-    SettingText,
-  },
-  methods: {
-    onSave() {
-      showMessage({ text: this.i18n('msgSavedBlacklist') });
-      sendCmd('BlacklistReset');
-    },
-  },
-};
+<script setup>
+import VmBlacklistBody from './vm-blacklist-body';
 </script>
